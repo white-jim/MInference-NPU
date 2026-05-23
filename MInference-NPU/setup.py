@@ -1,0 +1,52 @@
+# Copyright (c) 2026
+# Licensed under The MIT License [see LICENSE for details]
+#
+# MInference-NPU 安装脚本（v1）
+# - 不构建 CUDA 扩展（v1 NPU 端用 Triton-Ascend 重写索引展开 kernel）
+# - 与上游 MInference 的 setup.py 区别：去掉 CUDAExtension/cmdclass
+
+from setuptools import find_packages, setup
+
+with open("minference/version.py", "r") as f:
+    exec(f.read())  # noqa: S102 — 注入 VERSION
+
+setup(
+    name="minference-npu",
+    version=VERSION,  # noqa: F821 — 来自 exec 注入
+    description="MInference 1.0 ported to Huawei Ascend NPU (v1)",
+    long_description=(
+        "Ascend NPU port of Microsoft MInference 1.0 long-context prefill "
+        "acceleration. Targets CANN 8.3+ / torch_npu 2.6+ / triton-ascend. "
+        "v1 scope: vertical_and_slash + block_sparse + stream_llm + dense fallback."
+    ),
+    author="MInference-NPU contributors",
+    license="MIT",
+    python_requires=">=3.9",
+    packages=find_packages(exclude=["tests", "tests.*", "examples", "examples.*"]),
+    include_package_data=True,
+    package_data={
+        "minference.configs": ["*.json", "leank/*"],
+    },
+    install_requires=[
+        "torch>=2.6.0",
+        # torch_npu / triton-ascend / CANN 走昇腾官方渠道，pip 上不直接拉取
+        "transformers>=4.45",
+        "accelerate>=0.28",
+        "numpy",
+        # 上游 MInference 还依赖 flash-attn / sgl_kernel / vllm-flash-attn —— NPU 上不可用，
+        # 已在 ops / patch 层用 try-except 守护，不写入 install_requires
+    ],
+    extras_require={
+        "dev": [
+            "pytest",
+            "pytest-xdist",
+        ],
+    },
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: POSIX :: Linux",
+    ],
+)

@@ -1,0 +1,61 @@
+exclude: 'build'
+
+default_language_version:
+    python: python3
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit suggestions'
+  autoupdate_schedule: 'quarterly'
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+    -   id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+    -   id: check-ast
+    -   id: check-merge-conflict
+    -   id: no-commit-to-branch
+        args: ['--branch=main']
+    -   id: check-added-large-files
+        args: ['--maxkb=500']
+    -   id: end-of-file-fixer
+        exclude: '^(.*\.svg)$'
+    -   id: check-symlinks
+    -   id: check-yaml
+    -   id: check-toml
+    -   id: detect-private-key
+    -   id: debug-statements
+    -   id: check-ast
+    -   id: check-json
+    -   id: check-byte-order-marker
+        exclude: .gitignore
+    -   id: trailing-whitespace
+
+-   repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+    -   id: insert-license
+        files: \.(py|sh|toml)$
+        stages: [pre-commit]
+        args:
+        - --license-filepath
+        - assets/license_header.txt
+        - --use-current-year
+
+-   repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+    -   id: isort
+        stages: [pre-commit]
+-   repo: https://github.com/psf/black
+    rev: 23.3.0
+    hooks:
+    -   id: black
+        stages: [pre-commit]
+        exclude: minference/ops|minference/modules/minference\_forward\.py
+-   repo: https://github.com/nbQA-dev/nbQA
+    rev: 1.7.1
+    hooks:
+    -   id: nbqa-black
+        stages: [pre-commit]
