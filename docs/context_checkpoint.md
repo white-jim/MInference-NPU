@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。读这一份就能接着干，不必重新探索代码库。
-> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1，下一步进入 M2）
+> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + **M2 步骤 1**（streaming kernel 文件落地），下一步：M2 步骤 2 —— 接入 `__init__.py` / `minference_forward.py` + 写单测 + 写文档）
 > 工作目录：`D:\works\算法迁移\`
 
 ---
@@ -55,6 +55,28 @@
 
 **Windows 上 syntax 全通过**，实机测试待 NPU 服务器到位后跑。
 
+### 2.4 M2 — Streaming kernel（**进行中**，2026-05-23 完成步骤 1）
+
+**已完成（步骤 1：kernel 文件落地）**
+- **新增** `minference/ops/streaming_kernel_npu.py`：
+  - `streaming_forward(q, k, v, n_init, n_local)`：顶层入口，签名严格对齐上游 `streaming_kernel.py:streaming_forward`
+  - head_dim 不在 `{16,32,64,128,256,512}` 时 pad 到 2 的幂，输出截回原始 head_dim（与上游一致）
+  - 短路 `k_len <= n_local`：退化为 `backend_npu.dense_attention`（causal dense）
+  - **NPU 路径** `_streaming_npu`：两段 `npu_fusion_attention` + log-sum-exp 合并
+    - 段 1：sliding-window-only，`sparse_mode=4`（band），`pre_tockens=n_local-1`，`next_tockens=0`
+    - 段 2：仅前 `n_init` 个 sink key，自定义 `atten_mask` 排除 sliding 重叠（complement-sliding-window 思路；mask shape `[1,1,S_q,n_init]`，长上下文下也很小）
+    - 合并：`m_new = max(m1,m2)`；`o = (o1*l1*exp(m1-m)+o2*l2*exp(m2-m))/(l1*exp(m1-m)+l2*exp(m2-m))`；含 `l==0` 防御
+    - 取 `softmax_max[..., :1]` / `softmax_sum[..., :1]` 处理 NPU FA 的 8-lane tile padding；兼容 3D 返回
+    - `n_init <= 0` 或"段 2 全 mask"时单段返回 o1，避免 -inf 触发 NaN
+  - **非 NPU 路径** `_streaming_pytorch_ref`：纯 PyTorch sink+sliding mask，按 q 分块控制 mask 在 ~4M 元素；fp32 softmax；同时作为单测黄金参考
+- Windows `py_compile` 通过；本机无 torch，数值校验留到 M2 步骤 2 的单测里跑
+
+**待办（步骤 2-4：接入、单测、文档）**
+- [ ] `minference/__init__.py`：`streaming_forward = _dense` → `from .ops.streaming_kernel_npu import streaming_forward`，删掉 wrapper
+- [ ] `minference/modules/minference_forward.py:gather_last_q_vertical_slash_topk_v4`：`stream_llm` 分支由 `dense_attention(...)` 改为 `streaming_forward(q, k, v, vertical_size, slash_size)`（上游用 `(vertical_size, slash_size)` 复用为 `(n_init, n_local)`，见上游 `minference_forward.py:481-486`）
+- [ ] **新增** `tests/test_streaming_kernel.py`：多组 `(n_init, n_local)` + 三种 `k_len` 区段（短路 / 边界 / 长上下文），与 PyTorch ref 内嵌的"逐 row naive 实现"做 max_abs_diff < 1e-4 校验；NPU 上额外跑 `_streaming_npu` vs `_streaming_pytorch_ref` 对比 < 1e-2
+- [ ] **新增** `docs/M2_streaming.md`：算法、接口、两段合并公式、测试跑法、与 M3 衔接
+
 ---
 
 ## 3. v1 决策速记（已拍板，写入 `docs/migration_plan_v1.md`）
@@ -75,7 +97,7 @@
 [x] 调研 + 方案拍板
 [x] M0 环境与骨架（按假定 910B 配置；实机回填待跑）
 [x] M1 上层 Python 链路打通（dense fallback）
-[ ] M2 Streaming kernel              ← 下一步
+[~] M2 Streaming kernel              ← 进行中（步骤 1/4 完成：kernel 文件落地）
 [ ] M3 Block-Sparse kernel
 [ ] M4-a convert_vertical_slash_indexes
 [ ] M4-b Vertical-Slash 主 kernel（核心难点）
@@ -91,28 +113,32 @@
 
 **目标**：把 `streaming_forward`（A-shape）从 dense fallback 替换为真稀疏调用，验证 `n_init=128 / n_local=3968` 默认配置语义等价。
 
-**核心思路**（plan §4 已定）：调研里明确"一行替换"，**不要硬翻 Triton-Ascend 版**。
+### 5.0 当前进度（2026-05-23）
+**步骤 1 已完成**：`minference/ops/streaming_kernel_npu.py` 落地（详见 §2.4）。
+下一会话直接从下面"步骤 2/3/4" 接着写即可，不必重读上游 streaming_kernel.py。
 
-### 5.1 实现路径（首选）
-直接用 `torch_npu.npu_fusion_attention(sparse_mode=4)` 表达 band-causal + sink：
-- `sparse_mode=4`（band-causal）：每个 query 只看前 `n_local` 个 token，外加前 `n_init` 个 sink
-- 若 `npu_fusion_attention` 的 `prefix` / `pre_tockens` 参数能覆盖 sink 段：一次调用搞定
-- 若覆盖不了：退化为 **两次 attention + 合并**（Python 层），仍然能接受
+### 5.1 实现路径（已采用 "两段 + 合并"）
+NPU 版 `streaming_forward` 内部走两段 `npu_fusion_attention` + log-sum-exp 合并（plan §4 备选路径）：
+- 段 1：`sparse_mode=4`（band），`pre_tockens=n_local-1`，`next_tockens=0` —— sliding window only
+- 段 2：仅前 n_init 个 sink key + 自定义 `atten_mask` 排除 sliding 重叠（complement-sliding-window 思路）
+- 跨段用 NPU FA 返回的 `softmax_max` / `softmax_sum` 做 LSE 合并
 
-### 5.2 落点（具体改哪几个文件）
-1. **新增** `minference/ops/streaming_kernel_npu.py`：写新的 `streaming_forward(q, k, v, n_init, n_local)` —— 接口与上游 `MInference/minference/ops/streaming_kernel.py:streaming_forward` 完全一致，内部用 `npu_fusion_attention(sparse_mode=4)` 实现
-2. **改** `minference/__init__.py`：把 `streaming_forward = _dense` 改为 `from .ops.streaming_kernel_npu import streaming_forward`（去掉小 wrapper）
-3. **改** `minference/modules/minference_forward.py:gather_last_q_vertical_slash_topk_v4`：把 `if ty == "stream_llm": return dense_attention(...)` 分支改为 `return streaming_forward(q, k, v, n_init, n_local)`（从 `self.best_pattern` 或 attn_kwargs 拿 n_init/n_local 默认值）
-4. **新增** `tests/test_streaming_kernel.py`：随机 q/k/v + 多组 `(n_init, n_local)`，与"PyTorch 黄金参考（手写 sink + sliding window mask + dense softmax）"差异 < 1e-2
-5. **新增** `docs/M2_streaming.md`：用法 + 接口约定 + 测试跑法
+之所以不走"sparse_mode=4 一次调用"：`pre_tockens`/`next_tockens` 表达的是 band，不能同时表达"前 n_init 个 token 永远可见"的 sink 段。`prefix` 在不同 torch_npu 版本上语义不稳定，暂不依赖。
+
+### 5.2 落点（具体改哪几个文件） — 步骤 2/3/4 待办
+1. **改** `minference/__init__.py`：把 `streaming_forward = _dense` 改为 `from .ops.streaming_kernel_npu import streaming_forward`（去掉 wrapper）
+2. **改** `minference/modules/minference_forward.py:gather_last_q_vertical_slash_topk_v4`：把 `if ty == "stream_llm": return dense_attention(...)` 分支改为 `return streaming_forward(q, k, v, vertical_size, slash_size)`（上游约定：`stream_llm` 分支 best_pattern 的 (v_size, s_size) 复用为 (n_init, n_local)，见 `MInference/minference/modules/minference_forward.py:481-486`）
+3. **新增** `tests/test_streaming_kernel.py`：随机 q/k/v + 多组 `(n_init, n_local)`，与"PyTorch 黄金参考（手写 sink + sliding window mask + dense softmax）"差异 < 1e-2；NPU 上额外做 `_streaming_npu` vs `_streaming_pytorch_ref` 对照
+4. **新增** `docs/M2_streaming.md`：算法说明、两段 LSE 合并公式、接口约定、测试跑法
 
 ### 5.3 验收（plan §4）
 - `test_streaming_kernel.py` 全 PASS
 - 固定 best_pattern 把所有 head 强制设为 `stream_llm` 的 case，输出与"该 pattern 在 CUDA 上的输出"差异 < 1e-2
 
 ### 5.4 关键参考
-- 上游接口：`MInference/minference/ops/streaming_kernel.py:26` (`stream_llm_forward`) + `:streaming_forward` 入口
-- 上游 NPU 版门面已存在：`MInference-NPU/minference/__init__.py:streaming_forward`（当前指向 dense）
+- 上游接口：`MInference/minference/ops/streaming_kernel.py:611` (`streaming_forward`) + `:680` (`stream_llm_forward`)
+- 上游 stream_llm 分支调度：`MInference/minference/modules/minference_forward.py:474-486`
+- v1 NPU kernel 实现：`MInference-NPU/minference/ops/streaming_kernel_npu.py`
 - 调研对照表：`docs/ascend_migration_survey.md` Streaming 行 + plan §4 "关键点"段
 
 ---
