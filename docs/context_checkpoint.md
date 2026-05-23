@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。读这一份就能接着干，不必重新探索代码库。
-> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + M2 + M3 + **M4 全部步骤**（convert_vertical_slash_indexes CPU Python + vertical-slash NPU kernel + 接入 + 单测 + 文档），下一步：M5 端到端联调 + 精度/性能/效果）
+> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + M2 + M3 + **M4 全部步骤**（convert_vertical_slash_indexes CPU Python + vertical-slash NPU kernel + 接入 + 单测 + 文档）；**代码审查已完成，发现 3 个必现崩溃 + 2 个潜在崩溃 + 4 个性能大坑，见 §11**，下一步：先 Bug 修复（§11 B1/B2/B3/P3/B4/P4），再 M5 端到端联调）
 > 工作目录：`D:\tempt\算法迁移\`（本次会话）
 
 ---
@@ -160,6 +160,7 @@
 [x] M3 Block-Sparse kernel           ← 已完成（步骤 1-4 全部完成）
 [x] M4-a convert_vertical_slash_indexes  ← 已完成（CPU Python 双指针，与 CUDA kernel 等价）
 [x] M4-b Vertical-Slash 主 kernel    ← 已完成（cumsum mask + npu_fusion_attention + 在线估计接入）
+[ ] Bug 修复（代码审查发现 3 个必现崩溃 + 2 个潜在崩溃，见 §11）← 下一步，优先于 M5
 [ ] M5 端到端联调 + 精度/性能/效果
 [ ] migration_v1_notes.md + migration_v1_report.md
 ```
@@ -304,3 +305,126 @@ M5 不引入新代码，主要是实机验证：
   1. device-agnostic（禁止写死 `npu:0`、所有 tensor 跟随输入 device、Triton-Ascend kernel launch 跟随输入）
   2. accelerate ≥ 0.28
   3. 长上下文场景手动给 `max_memory` 留 KV 余量（配置层面解决，非代码改动）
+
+---
+
+## 11. 代码审查结果（2026-05-23）
+
+> 对 M0–M4 全部产出文件的全量审查，重点：NPU 上必现崩溃、潜在崩溃、性能大坑。
+> 修复状态初始均为 `[ ]`，修复后改为 `[x]`。
+
+### 11.1 必现崩溃（NPU 上 100% 报错）
+
+#### B1 — `_build_vs_mask_from_indexes`：CPU 张量做 NPU 张量的 index
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:128-157`
+- **根因**：`convert_vertical_slash_indexes`（`cuda_shim.py`）输出的 `block_offset`、`column_index` 全是 **CPU tensor**（创建时没有指定 device）。但 `_build_vs_mask_from_indexes` 接收 `device=q.device`（NPU），在内部创建 NPU 张量后，用 CPU 张量做 index：
+  ```python
+  blk_starts = block_offset[b, h, bq, :nblk].long()      # CPU tensor
+  cov_delta = torch.zeros(S_k + 1, dtype=torch.int32, device=device)  # NPU tensor
+  cov_delta.scatter_add_(0, blk_starts.clamp(0, S_k), ...)  # CRASH: index on CPU, self on NPU
+
+  cols = column_index[b, h, bq, :ncol].long().clamp(0, S_k - 1)  # CPU tensor
+  vert_cov[cols] = True   # CRASH: index on CPU, vert_cov on NPU
+  ```
+- **修复**：使用前加 `.to(device)`：
+  ```python
+  blk_starts = block_offset[b, h, bq, :nblk].long().to(device)
+  blk_ends   = (blk_starts + block_size).clamp(max=S_k)
+  cols = column_index[b, h, bq, :ncol].long().to(device).clamp(0, S_k - 1)
+  ```
+- **状态**：`[ ]`
+
+#### B2 — `decode_dense`：`npu_incre_flash_attention` 返回值未解包
+- **文件**：`minference/backend_npu/attention.py:167-174`
+- **根因**：`npu_incre_flash_attention` 返回元组 `(output, ...)` 而非单个 tensor，但函数直接 return，没有像 `dense_attention` 一样做 `result[0] if isinstance(result, (tuple, list)) else result` 解包。上游拿到 tuple 后 shape 操作必然报错。
+- **修复**：
+  ```python
+  result = torch_npu.npu_incre_flash_attention(q, k_cache, v_cache, ...)
+  return result[0] if isinstance(result, (tuple, list)) else result
+  ```
+- **状态**：`[ ]`
+
+#### B3 — `seqlens` 硬编码 batch=1，B>1 时越界
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:189`（`_vertical_slash_pytorch_ref`）和 `:234`（`_vertical_slash_npu`）
+- **根因**：两处都写死 `seqlens = torch.tensor([S_k], dtype=torch.int32)`，shape 为 `[1]`。但 `convert_vertical_slash_indexes` 中 `seq_all = seqlens.cpu().tolist()` 然后 `for b in range(batch_size): seqlen = int(seq_all[b])`。B > 1 时 `seq_all[1]` 越界。
+- **修复**：
+  ```python
+  seqlens = torch.tensor([S_k] * B, dtype=torch.int32)
+  ```
+- **状态**：`[ ]`
+
+---
+
+### 11.2 潜在崩溃（特定条件下触发）
+
+#### B4 — `streaming_forward` / `block_sparse_attention` 强断言 q/k/v shape 完全一致
+- **文件**：`streaming_kernel_npu.py:313-315`，`block_sparse_kernel_npu.py:276-278`
+- **根因**：`assert q.shape == k.shape == v.shape`。有 KV cache 时（k_len > q_len），k 和 v shape 与 q 不一致，AssertionError。`vertical_slash_kernel_npu.py` 中已正确分离 S_q / S_k，可参照。
+- **修复**：把断言改为仅检查 dim=4 和 B/H/D 三维：
+  ```python
+  assert q.dim() == 4
+  assert q.shape[0] == k.shape[0] and q.shape[1] == k.shape[1] and q.shape[-1] == k.shape[-1]
+  ```
+- **状态**：`[ ]`
+
+#### B5 — `atten_mask` 传 `bool` dtype，部分 torch_npu 版本要求 `uint8`
+- **文件**：`block_sparse_kernel_npu.py:235`，`vertical_slash_kernel_npu.py:250`，`streaming_kernel_npu.py:255`
+- **根因**：三个 kernel 均将 `torch.bool` mask 传给 `npu_fusion_attention(sparse_mode=1, atten_mask=mask)`。torch_npu 部分版本的 `npu_fusion_attention` 对 `atten_mask` 的 dtype 有严格要求（需 `uint8` 而非 `bool`），传 `bool` 会 TypeError。
+- **修复**：实机验证后按实际 torch_npu 版本决定；建议统一加 `.to(torch.bool)` 或 `.to(torch.uint8)` 后再传入，并在 `SETUP.md` 中记录版本约束。
+- **状态**：`[ ]`
+
+---
+
+### 11.3 重大性能问题
+
+#### P1 — `_build_vs_mask_from_indexes`：三层 Python 循环内批量 NPU dispatch
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:113-158`
+- **根因**：`for b × for h × for bq` 共 B×H×num_rows 次 Python 迭代，每次内部执行多个 NPU 内核（`scatter_add_`、`cumsum`、bool 运算）。对典型 16k 序列（`_MAX_SEQ_FOR_MASK` 阈值）：1×32×256 = 8192 次迭代 × ~4 次 NPU dispatch = ~32k NPU 调度，每次有 Python→CANN 固定开销（10–100 μs），合计 **320ms–3.2s** 的纯 dispatch 损耗，远超实际计算。
+- **修复方向**：将整个循环向量化——把 `block_offset`、`column_index` 全量搬到 NPU，用 batch 化的 scatter/cumsum 一次完成所有 block 的 coverage 计算，消除 Python 循环。
+- **状态**：`[ ]`（需较大重构）
+
+#### P2 — `convert_vertical_slash_indexes`：三层 Python 循环 × 纯 Python while 扫描
+- **文件**：`minference/backend_npu/cuda_shim.py:205-232`
+- **根因**：`for b × for h × for block_idx_m`，最内层 `_process_block` 是纯 Python while 循环，每次扫描全部 NNZ_V + NNZ_S（典型值 ~7000）。总操作量：32 × 2000 × 7000 ≈ **4.5 亿次 Python 操作**（128k 序列），估算耗时 **30–60 秒**。注释"计算量极小"是针对单 head 单次调用，忽略了三重循环规模。
+- **修复方向**：用 NumPy/Cython 向量化替代纯 Python while 循环，或引入 Triton-Ascend kernel（方案 B）。短期可先用 NumPy 批量处理 v_list/s_list 的双指针逻辑，减少 Python 层级。
+- **状态**：`[ ]`（需较大重构）
+
+#### P3 — `init_minference_parameters` 每次 forward 重读 JSON + 句柄泄漏
+- **文件**：`minference/modules/minference_forward.py:133-159`
+- **根因**：`init_minference_parameters` 在每次 `forward` 开头无条件调用，内部用裸 `open(file)` 打开同一文件**两次**（一次 `len(json.load(open(...)))`，一次 `json.load(open(...))[...]`），文件句柄不关闭。32 层模型每次推理 = 64 次文件 I/O + 64 个泄漏句柄。
+- **修复**（最容易，2 行）：在函数顶部加一次性初始化保护：
+  ```python
+  def init_minference_parameters(self) -> None:
+      if getattr(self, '_minference_initialized', False):
+          return
+      ...  # 原有逻辑，open 改成 with open(...) as f: data = json.load(f)
+      self._minference_initialized = True
+  ```
+- **状态**：`[ ]`
+
+#### P4 — `attn_mask.all().item()` 强制 NPU-CPU 同步
+- **文件**：`minference/ops/streaming_kernel_npu.py:244`
+- **根因**：`if bool(attn_mask.all().item()):` 中 `attn_mask` 在 NPU 上，`.item()` 强制将结果从 NPU 搬回 CPU，阻塞 NPU 异步执行流水线，每次推理必然产生一次 NPU-CPU 同步等待。
+- **修复**：改为在 CPU 侧用纯 Python 数值判断——当 `s_k - s_q < n_local`（即所有 query 的 sliding window 已覆盖从 0 开始的全部 sink）时才跳过段 2，不需要真正构建 mask 后检查：
+  ```python
+  # 若最早的 query（abs_pos = s_k - s_q）的 sliding window 左边界 <= 0，则没有 sink 贡献
+  if (s_k - s_q) - int(n_local) + 1 <= 0:
+      return o1
+  ```
+- **状态**：`[ ]`
+
+---
+
+### 11.4 修复优先级
+
+| 优先级 | 编号 | 估计改动量 | 说明 |
+|---|---|---|---|
+| P0（立刻改） | B1 | 3 行 | NPU 上每次都崩溃，M5 无法跑通 |
+| P0（立刻改） | B2 | 2 行 | decode 路径必崩 |
+| P0（立刻改） | B3 | 1 行 | B>1 必崩（推理通常 B=1，但测试可能触发） |
+| P1（较早改） | P3 | ~10 行 | 最容易改的性能问题，每次推理必触发 |
+| P1（较早改） | B4 | 4 行 | 有 KV cache 时触发，KV cache 场景常见 |
+| P1（较早改） | P4 | 3 行 | 热路径同步，简单修复 |
+| P2（实机验证时） | B5 | 1 行/处 | 实机才能确认是否触发 |
+| P3（性能优化阶段） | P1 | 大重构 | 向量化 mask 构建，M5 性能测试后再做 |
+| P3（性能优化阶段） | P2 | 大重构 | 向量化 convert_vertical_slash_indexes |
