@@ -17,24 +17,15 @@ from .models_patch import MInference
 from .patch import minference_patch, patch_hf
 from .version import VERSION as __version__
 
-# v1 阶段稀疏算子接口的"门面"：M2-M4 完成时会指向真 NPU 稀疏 kernel；M1 阶段先指向
-# dense fallback。三者的签名与上游对齐（多余参数被忽略），方便上游测试代码原样跑通。
-from .backend_npu import dense_attention as _dense
+# M2: streaming_forward 已接入真 NPU kernel（两段 npu_fusion_attention + LSE 合并）
+from .ops.streaming_kernel_npu import streaming_forward
 
+# M3: block_sparse_attention 已接入真 NPU kernel（bool mask + npu_fusion_attention sparse_mode=1）
+from .ops.block_sparse_kernel_npu import block_sparse_attention
 
-def vertical_slash_sparse_attention(q, k, v, vertical_topk=None, slash=None):  # noqa: D401
-    """v1 M1: 等价于 backend_npu.dense_attention(q, k, v, causal=True)。M4-b 时替换。"""
-    return _dense(q, k, v, causal=True)
-
-
-def block_sparse_attention(q, k, v, topk=None):  # noqa: D401
-    """v1 M1: 等价于 backend_npu.dense_attention(q, k, v, causal=True)。M3 时替换。"""
-    return _dense(q, k, v, causal=True)
-
-
-def streaming_forward(q, k, v, n_init=None, n_local=None):  # noqa: D401
-    """v1 M1: 等价于 backend_npu.dense_attention(q, k, v, causal=True)。M2 时替换。"""
-    return _dense(q, k, v, causal=True)
+# M4: vertical_slash_sparse_attention 已接入真 NPU kernel
+# （convert_vertical_slash_indexes CPU + bool mask + npu_fusion_attention sparse_mode=1）
+from .ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention
 
 __all__ = [
     "MInference",

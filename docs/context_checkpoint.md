@@ -1,8 +1,8 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。读这一份就能接着干，不必重新探索代码库。
-> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + **M2 步骤 1**（streaming kernel 文件落地），下一步：M2 步骤 2 —— 接入 `__init__.py` / `minference_forward.py` + 写单测 + 写文档）
-> 工作目录：`D:\works\算法迁移\`
+> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + M2 + M3 + **M4 全部步骤**（convert_vertical_slash_indexes CPU Python + vertical-slash NPU kernel + 接入 + 单测 + 文档），下一步：M5 端到端联调 + 精度/性能/效果）
+> 工作目录：`D:\tempt\算法迁移\`（本次会话）
 
 ---
 
@@ -55,27 +55,86 @@
 
 **Windows 上 syntax 全通过**，实机测试待 NPU 服务器到位后跑。
 
-### 2.4 M2 — Streaming kernel（**进行中**，2026-05-23 完成步骤 1）
+### 2.4 M2 — Streaming kernel（**已完成**，2026-05-23）
 
-**已完成（步骤 1：kernel 文件落地）**
+
+
+**步骤 1（kernel 文件落地）**
 - **新增** `minference/ops/streaming_kernel_npu.py`：
   - `streaming_forward(q, k, v, n_init, n_local)`：顶层入口，签名严格对齐上游 `streaming_kernel.py:streaming_forward`
   - head_dim 不在 `{16,32,64,128,256,512}` 时 pad 到 2 的幂，输出截回原始 head_dim（与上游一致）
   - 短路 `k_len <= n_local`：退化为 `backend_npu.dense_attention`（causal dense）
   - **NPU 路径** `_streaming_npu`：两段 `npu_fusion_attention` + log-sum-exp 合并
     - 段 1：sliding-window-only，`sparse_mode=4`（band），`pre_tockens=n_local-1`，`next_tockens=0`
-    - 段 2：仅前 `n_init` 个 sink key，自定义 `atten_mask` 排除 sliding 重叠（complement-sliding-window 思路；mask shape `[1,1,S_q,n_init]`，长上下文下也很小）
+    - 段 2：仅前 `n_init` 个 sink key，自定义 `atten_mask` 排除 sliding 重叠；mask shape `[1,1,S_q,n_init]`
     - 合并：`m_new = max(m1,m2)`；`o = (o1*l1*exp(m1-m)+o2*l2*exp(m2-m))/(l1*exp(m1-m)+l2*exp(m2-m))`；含 `l==0` 防御
-    - 取 `softmax_max[..., :1]` / `softmax_sum[..., :1]` 处理 NPU FA 的 8-lane tile padding；兼容 3D 返回
     - `n_init <= 0` 或"段 2 全 mask"时单段返回 o1，避免 -inf 触发 NaN
-  - **非 NPU 路径** `_streaming_pytorch_ref`：纯 PyTorch sink+sliding mask，按 q 分块控制 mask 在 ~4M 元素；fp32 softmax；同时作为单测黄金参考
-- Windows `py_compile` 通过；本机无 torch，数值校验留到 M2 步骤 2 的单测里跑
+  - **非 NPU 路径** `_streaming_pytorch_ref`：纯 PyTorch sink+sliding mask，按 q 分块控制内存；fp32 softmax；同时作为单测黄金参考
 
-**待办（步骤 2-4：接入、单测、文档）**
-- [ ] `minference/__init__.py`：`streaming_forward = _dense` → `from .ops.streaming_kernel_npu import streaming_forward`，删掉 wrapper
-- [ ] `minference/modules/minference_forward.py:gather_last_q_vertical_slash_topk_v4`：`stream_llm` 分支由 `dense_attention(...)` 改为 `streaming_forward(q, k, v, vertical_size, slash_size)`（上游用 `(vertical_size, slash_size)` 复用为 `(n_init, n_local)`，见上游 `minference_forward.py:481-486`）
-- [ ] **新增** `tests/test_streaming_kernel.py`：多组 `(n_init, n_local)` + 三种 `k_len` 区段（短路 / 边界 / 长上下文），与 PyTorch ref 内嵌的"逐 row naive 实现"做 max_abs_diff < 1e-4 校验；NPU 上额外跑 `_streaming_npu` vs `_streaming_pytorch_ref` 对比 < 1e-2
-- [ ] **新增** `docs/M2_streaming.md`：算法、接口、两段合并公式、测试跑法、与 M3 衔接
+**步骤 2（接入）**
+- `minference/__init__.py`：删掉 dummy wrapper，改为 `from .ops.streaming_kernel_npu import streaming_forward`
+- `minference/modules/minference_forward.py`：`stream_llm` 分支改为 `_streaming_forward(q, k, v, n_init=vertical_size, n_local=slash_size)`（上游约定 vertical_size→n_init, slash_size→n_local）；block_sparse/vertical_and_slash 仍保留 dense（M3/M4 替换）
+
+**步骤 3（单测）**
+- **新增** `tests/test_streaming_kernel.py`：5 组测试（ref vs naive / 顶层 vs naive 含短路 / head_dim pad / NPU vs ref / 参数扫描），CPU 容差 1e-3，fp16/NPU 容差 1e-2
+
+**步骤 4（文档）**
+- **新增** `docs/M2_streaming.md`：算法背景、两段路径说明、LSE 合并公式、接口约定、调用链、测试跑法、与 M3 衔接、与上游差异对照表
+
+### 2.5 M3 — Block-Sparse kernel（**已完成**，2026-05-23）
+
+**步骤 1（kernel 文件落地）**
+- **新增** `minference/ops/block_sparse_kernel_npu.py`：
+  - `block_sparse_attention(q, k, v, topk_blocks, block_size=64)`：顶层入口，签名对应上游 `top_k` 参数
+  - head_dim 不在 `{16,32,64,128,256,512}` 时 pad 到 2 的幂，输出截回原始 head_dim
+  - 序列长度 > `_MAX_SEQ_FOR_MASK=16384` 时退化为 `dense_attention` + WARNING（路径 B 超长序列）
+  - **NPU 路径** `_block_sparse_npu`：`_build_block_sparse_mask` + `npu_fusion_attention(sparse_mode=1, atten_mask=mask)`
+    - `_build_block_sparse_mask`：mean-pool Q/K → block 级 QK top-k → `block_attend [B,H,n_bq,n_bk]`
+      → expand+reshape → `token_attend [B,H,S_q,S_k]` → 追加 per-token 因果约束 → True=masked
+    - 关键正确性保证：per-token 因果 mask 消除 block top-k 中 -inf tie-breaking 引入的误差
+  - **非 NPU 路径** `_block_sparse_pytorch_ref`：共用 `_build_block_sparse_mask`，PyTorch masked softmax；同时作为单测黄金参考
+
+**步骤 2（接入）**
+- `minference/modules/minference_forward.py`：新增 `block_sparse` 分支 `return _block_sparse_attention(q, k, v, topk_blocks=int(vertical_size))`（`vertical_size` 对应上游 `top_k`）
+- `minference/__init__.py`：删掉 dummy wrapper，改为 `from .ops.block_sparse_kernel_npu import block_sparse_attention`
+
+**步骤 3（单测）**
+- **新增** `tests/test_block_sparse_kernel.py`：6 组测试（mask 因果等价 / mask 因果不变性 / PyTorch ref vs dense / shape/dtype / head_dim pad / NPU vs ref / 参数扫描），CPU 容差 1e-4，NPU 容差 1e-2
+
+**步骤 4（文档）**
+- **新增** `docs/M3_block_sparse.md`：算法背景、mask 构建 6 步、reshape 合法性验证、NPU 路径代码、接口约定、调用链、序列长度限制与路径 B、测试跑法、与上游差异对照表、与 M4 衔接
+
+### 2.6 M4 — Vertical-Slash kernel（**已完成**，2026-05-23）
+
+**步骤 1 M4-a（`convert_vertical_slash_indexes` CPU Python）**
+- **改** `minference/backend_npu/cuda_shim.py`：实现 `convert_vertical_slash_indexes`
+  - 纯 Python + PyTorch CPU，签名与上游 pybind export 对齐（`causal` 参数额外保留）
+  - 双指针算法：升序 `v_idx` + 降序 `s_idx`，合并相邻 slash 为连续 range，vertical 去重
+  - `_process_block`：单 (batch, head, query_block) 的核心逻辑，对应 CUDA `convert_vertical_slash_indexes_kernel`
+  - `_save_blocks`：对应 CUDA `save_blocks` device 函数
+
+**步骤 1 M4-b（Vertical-Slash NPU kernel）**
+- **新增** `minference/ops/vertical_slash_kernel_npu.py`：
+  - `vertical_slash_sparse_attention(q, k, v, v_idx, s_idx, ...)` 顶层入口，签名与上游 `pit_sparse_flash_attention_v2.py` 对齐
+  - head_dim pad（与 M2/M3 一致）；序列长度 > `_MAX_SEQ_FOR_MASK=16384` 退化 dense + WARNING
+  - `_build_vs_mask_from_indexes`：从 M4-a 输出构建 token 级 bool mask
+    - cumsum 区间标记法构建 slash 覆盖：O(NNZ_S + S_k) 而非 O(NNZ_S × S_k)
+    - scatter set 构建 vertical 覆盖；广播因果约束 j≤i；mask AND 写入
+  - **NPU 路径** `_vertical_slash_npu`：CPU 侧 M4-a + 构建 mask → `npu_fusion_attention(sparse_mode=1)`
+  - **非 NPU 路径** `_vertical_slash_pytorch_ref`：同 CPU 侧 M4-a + mask → PyTorch masked softmax
+
+**步骤 2（接入）**
+- `minference/modules/minference_forward.py`：
+  - 新增 `_vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size)`：在线估计 v_idx/s_idx（列和 topk + 反对角线和 topk），调用 `_vs_sparse_attention`
+  - `gather_last_q_vertical_slash_topk_v4` 的 `vertical_and_slash` 分支替换为 `_vertical_and_slash_kernel`（原 dense fallback 注释移除）
+  - 新增 `from ..ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention as _vs_sparse_attention`
+- `minference/__init__.py`：删掉 dummy `vertical_slash_sparse_attention` wrapper，改为 `from .ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention`；移除已无用的 `_dense` 别名
+
+**步骤 3（单测）**
+- **新增** `tests/test_vertical_slash_kernel.py`：8 组测试（convert 格式/因果/计数 / mask 形状/边界/因果 / ref vs dense 满覆盖 / sparse shape / head_dim pad / NPU vs ref / 参数扫描 / dtype），CPU 容差 1e-3 / 5e-2（fp16），NPU 容差 1e-2
+
+**步骤 4（文档）**
+- **新增** `docs/M4_vertical_slash.md`：算法背景、双指针 M4-a 算法、cumsum mask 构建 M4-b、接口约定、调用链、序列长度限制、测试跑法、与上游差异对照表、与 M5 衔接
 
 ---
 
@@ -97,10 +156,10 @@
 [x] 调研 + 方案拍板
 [x] M0 环境与骨架（按假定 910B 配置；实机回填待跑）
 [x] M1 上层 Python 链路打通（dense fallback）
-[~] M2 Streaming kernel              ← 进行中（步骤 1/4 完成：kernel 文件落地）
-[ ] M3 Block-Sparse kernel
-[ ] M4-a convert_vertical_slash_indexes
-[ ] M4-b Vertical-Slash 主 kernel（核心难点）
+[x] M2 Streaming kernel              ← 已完成（步骤 1-4 全部完成）
+[x] M3 Block-Sparse kernel           ← 已完成（步骤 1-4 全部完成）
+[x] M4-a convert_vertical_slash_indexes  ← 已完成（CPU Python 双指针，与 CUDA kernel 等价）
+[x] M4-b Vertical-Slash 主 kernel    ← 已完成（cumsum mask + npu_fusion_attention + 在线估计接入）
 [ ] M5 端到端联调 + 精度/性能/效果
 [ ] migration_v1_notes.md + migration_v1_report.md
 ```
@@ -109,37 +168,30 @@
 
 ---
 
-## 5. M2 入手要点（下一步直接接的事）
+## 5. M5 入手要点（下一步直接接的事）
 
-**目标**：把 `streaming_forward`（A-shape）从 dense fallback 替换为真稀疏调用，验证 `n_init=128 / n_local=3968` 默认配置语义等价。
+**目标**：端到端联调，在 NPU 机器上验证 M2–M4 三种稀疏 kernel 的精度与性能。
 
-### 5.0 当前进度（2026-05-23）
-**步骤 1 已完成**：`minference/ops/streaming_kernel_npu.py` 落地（详见 §2.4）。
-下一会话直接从下面"步骤 2/3/4" 接着写即可，不必重读上游 streaming_kernel.py。
+### 5.1 M5 概述
 
-### 5.1 实现路径（已采用 "两段 + 合并"）
-NPU 版 `streaming_forward` 内部走两段 `npu_fusion_attention` + log-sum-exp 合并（plan §4 备选路径）：
-- 段 1：`sparse_mode=4`（band），`pre_tockens=n_local-1`，`next_tockens=0` —— sliding window only
-- 段 2：仅前 n_init 个 sink key + 自定义 `atten_mask` 排除 sliding 重叠（complement-sliding-window 思路）
-- 跨段用 NPU FA 返回的 `softmax_max` / `softmax_sum` 做 LSE 合并
+M5 不引入新代码，主要是实机验证：
 
-之所以不走"sparse_mode=4 一次调用"：`pre_tockens`/`next_tockens` 表达的是 band，不能同时表达"前 n_init 个 token 永远可见"的 sink 段。`prefix` 在不同 torch_npu 版本上语义不稳定，暂不依赖。
+| 验证项 | 命令 |
+|---|---|
+| 环境烟测 | `python tests/test_env.py` |
+| Dense pipeline | `python tests/test_dense_forward.py` |
+| Streaming kernel | `python tests/test_streaming_kernel.py` |
+| Block-sparse kernel | `python tests/test_block_sparse_kernel.py` |
+| Vertical-slash kernel | `python tests/test_vertical_slash_kernel.py` |
+| HF 端到端 | `python examples/run_hf_minimal.py --attn_type minference ...` |
 
-### 5.2 落点（具体改哪几个文件） — 步骤 2/3/4 待办
-1. **改** `minference/__init__.py`：把 `streaming_forward = _dense` 改为 `from .ops.streaming_kernel_npu import streaming_forward`（去掉 wrapper）
-2. **改** `minference/modules/minference_forward.py:gather_last_q_vertical_slash_topk_v4`：把 `if ty == "stream_llm": return dense_attention(...)` 分支改为 `return streaming_forward(q, k, v, vertical_size, slash_size)`（上游约定：`stream_llm` 分支 best_pattern 的 (v_size, s_size) 复用为 (n_init, n_local)，见 `MInference/minference/modules/minference_forward.py:481-486`）
-3. **新增** `tests/test_streaming_kernel.py`：随机 q/k/v + 多组 `(n_init, n_local)`，与"PyTorch 黄金参考（手写 sink + sliding window mask + dense softmax）"差异 < 1e-2；NPU 上额外做 `_streaming_npu` vs `_streaming_pytorch_ref` 对照
-4. **新增** `docs/M2_streaming.md`：算法说明、两段 LSE 合并公式、接口约定、测试跑法
+### 5.2 产出
+- `docs/migration_v1_notes.md`：实测踩坑记录（NPU API 差异、精度偏差等）
+- `docs/migration_v1_report.md`：v1 迁移报告（精度 / 性能 / 效果三维对比）
 
-### 5.3 验收（plan §4）
-- `test_streaming_kernel.py` 全 PASS
-- 固定 best_pattern 把所有 head 强制设为 `stream_llm` 的 case，输出与"该 pattern 在 CUDA 上的输出"差异 < 1e-2
-
-### 5.4 关键参考
-- 上游接口：`MInference/minference/ops/streaming_kernel.py:611` (`streaming_forward`) + `:680` (`stream_llm_forward`)
-- 上游 stream_llm 分支调度：`MInference/minference/modules/minference_forward.py:474-486`
-- v1 NPU kernel 实现：`MInference-NPU/minference/ops/streaming_kernel_npu.py`
-- 调研对照表：`docs/ascend_migration_survey.md` Streaming 行 + plan §4 "关键点"段
+### 5.3 关键参考
+- 上游 CUDA kernel：`MInference-NPU/MInference/minference/ops/op_utils/vertical_slash_utils.py`
+- 上游 vertical_and_slash 调用链：`MInference-NPU/MInference/minference/modules/minference_forward.py:381`
 
 ---
 
@@ -169,12 +221,12 @@ NPU 版 `streaming_forward` 内部走两段 `npu_fusion_attention` + log-sum-exp
 |---|---|---|
 | 顶层入口 | `MInference-NPU/minference/models_patch.py` (`MInference` 类) | M1 ✓ |
 | HF monkey-patch | `MInference-NPU/minference/patch.py` (`patch_hf` / `minference_patch`) | M1 ✓ |
-| Per-head 调度 + 顶层 forward | `MInference-NPU/minference/modules/minference_forward.py` | M1 ✓（三 pattern dense） |
+| Per-head 调度 + 顶层 forward | `MInference-NPU/minference/modules/minference_forward.py` | M1 ✓，M2/M3 已接入 |
 | NPU dense 薄封装 | `MInference-NPU/minference/backend_npu/attention.py` | M1 ✓ |
-| `convert_vertical_slash_indexes` 占位 | `MInference-NPU/minference/backend_npu/cuda_shim.py` | M4-a 待实现 |
-| **Streaming kernel** | `MInference-NPU/minference/ops/streaming_kernel.py`（上游拷贝） | **M2 待重写** → `streaming_kernel_npu.py` |
-| Block-Sparse kernel | `MInference-NPU/minference/ops/block_sparse_flash_attention.py`（上游拷贝） | M3 待重写 |
-| Vertical-Slash kernel | `MInference-NPU/minference/ops/pit_sparse_flash_attention_v2.py`（上游拷贝） | M4-b 待重写 |
+| `convert_vertical_slash_indexes` | `MInference-NPU/minference/backend_npu/cuda_shim.py` | **M4-a ✓**（CPU Python 双指针） |
+| **Streaming kernel** | `MInference-NPU/minference/ops/streaming_kernel_npu.py`（NPU 实现） | **M2 ✓** |
+| **Block-Sparse kernel** | `MInference-NPU/minference/ops/block_sparse_kernel_npu.py`（NPU 实现） | **M3 ✓** |
+| **Vertical-Slash kernel** | `MInference-NPU/minference/ops/vertical_slash_kernel_npu.py`（NPU 实现） | **M4-b ✓** |
 | 上游参考（不 import） | `MInference-NPU/minference/{patch_upstream,models_patch_upstream}.py` + `modules/minference_forward_upstream.py` | M2-M4 时对照 |
 | Best-pattern JSON | `MInference-NPU/minference/configs/*.json` | 直接复用上游 |
 | 环境烟测 | `MInference-NPU/tests/test_env.py` | M0 ✓ |

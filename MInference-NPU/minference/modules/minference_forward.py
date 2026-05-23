@@ -34,6 +34,9 @@ import torch.nn as nn
 from transformers.models.llama.modeling_llama import rotate_half
 
 from ..backend_npu import dense_attention, decode_dense
+from ..ops.streaming_kernel_npu import streaming_forward as _streaming_forward
+from ..ops.block_sparse_kernel_npu import block_sparse_attention as _block_sparse_attention
+from ..ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention as _vs_sparse_attention
 
 __all__ = [
     "init_minference_parameters",
@@ -193,13 +196,50 @@ def gather_qkv(q, k, v, attention_mask):
 # ----------------------------------------------------------------------------
 
 
-def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id: int):
-    """单 head 调度。v1 M1 阶段所有 pattern 退化为 dense。
+def _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size):
+    """在线估计 vertical/slash 索引，调用 vertical-slash 稀疏 attention。
 
-    M2: 把 "stream_llm" 分支换成 `streaming_forward` (用 npu_fusion_attention sparse_mode=4)
-    M3: 把 "block_sparse" 分支换成 `block_sparse_attention` (Triton-Ascend)
-    M4: 把 "vertical_and_slash" 分支换成 `vertical_slash_sparse_attention` (Triton-Ascend)
-    每一阶段在替换时把 dense_attention 改回上游对应 kernel 调用即可。
+    与上游 ``minference_forward_upstream.py:381 vertical_and_slash_kernel`` 等价：
+    - 取最后 last_q 个 query 做一次 QK 估计。
+    - 列和 → topk → v_idx（升序）。
+    - 反对角线和 → topk → s_idx（降序，= q_len - 1 - diag_from_upper_right）。
+    - 强制保留前 30 列（sink）和最近 100 条 slash（local window）。
+    """
+    q_len = q.shape[2]
+    vertical_size = min(q_len, max(int(vertical_size), 30))
+    slash_size = min(q_len, max(int(slash_size), 50))
+    last_q = min(LAST_Q, q_len)
+
+    # QK 估计（仅用最后 last_q 个 query）
+    qk = torch.matmul(q[:, :, -last_q:, :], k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
+    # 因果 mask（[1,1,last_q,last_q] 的右下角）
+    lq_mask = _last_q_mask(q.device)[:, :, -last_q:, -last_q:]  # [1,1,last_q,last_q]
+    qk[:, :, :, -last_q:] = torch.where(lq_mask, qk[:, :, :, -last_q:], float("-inf"))
+    qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)  # [B,H,last_q,q_len]
+
+    # Vertical：列和 → topk（保留前 30 sink 列）
+    vertical = qk.sum(-2, keepdim=True)              # [B,H,1,q_len]
+    vertical[..., :30] = torch.inf                   # 强制保留 sink
+    v_idx = torch.topk(vertical, vertical_size, dim=-1).indices  # [B,H,1,V]
+    v_idx = v_idx.reshape(q.shape[0], q.shape[1], -1)            # [B,H,V]
+    v_idx = v_idx.sort(dim=-1, descending=False).values.to(torch.int32)  # [B,H,V] 升序
+
+    # Slash：反对角线和 → topk（保留最近 100 条 local）
+    slash_diag = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]  # [B,H,q_len]
+    slash_diag[..., -100:] = torch.inf                            # 强制保留 local
+    s_raw_idx = torch.topk(slash_diag, slash_size, dim=-1).indices  # [B,H,S]
+    s_idx = (q_len - 1) - s_raw_idx                               # 转换为上游约定
+    s_idx = s_idx.sort(dim=-1, descending=True).values.to(torch.int32)  # [B,H,S] 降序
+
+    return _vs_sparse_attention(q, k, v, v_idx, s_idx)
+
+
+def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id: int):
+    """单 head 调度。
+
+    M2: stream_llm 分支接入真 NPU streaming kernel。
+    M3: block_sparse 分支接入真 NPU block-sparse kernel。
+    M4: vertical_and_slash 分支接入真 NPU vertical-slash kernel。
     """
     q_len = q.shape[2]
 
@@ -212,12 +252,16 @@ def gather_last_q_vertical_slash_topk_v4(self, q, k, v, head_id: int):
         head_id, ("vertical_and_slash", 1000, 6096, 1)
     )
 
-    # v1 M1：三种 pattern 全部退化 dense。在线估计代码暂时不跑（dense fallback 下结果不
-    # 依赖 vertical_topk / slash 索引；为节省 NPU 计算先省略）。
-    # M4-b 恢复时把下面这行替换为：
-    #   return _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size)
-    _ = (ty, vertical_size, slash_size)  # 让 IDE 不警告，M2-M4 会用到
-    return dense_attention(q, k, v, causal=True)
+    if ty == "stream_llm":
+        # M2: 上游约定 vertical_size → n_init, slash_size → n_local
+        return _streaming_forward(q, k, v, n_init=vertical_size, n_local=slash_size)
+
+    if ty == "block_sparse":
+        # M3: vertical_size 存储 top_k（保留的 key block 数）
+        return _block_sparse_attention(q, k, v, topk_blocks=int(vertical_size))
+
+    # M4: vertical_and_slash — 在线估计 v_idx/s_idx → sparse attention
+    return _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size)
 
 
 # ----------------------------------------------------------------------------
