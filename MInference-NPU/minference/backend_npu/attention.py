@@ -164,7 +164,7 @@ def decode_dense(
     #   (query, key, value, num_heads, input_layout, scale_value, ...)
     # 不同小版本签名略有差异；如遇 TypeError 上层 patch 会捕获并 fallback 到 npu_fusion_attention
     try:
-        return torch_npu.npu_incre_flash_attention(  # type: ignore[union-attr]
+        result = torch_npu.npu_incre_flash_attention(  # type: ignore[union-attr]
             q,
             k_cache,
             v_cache,
@@ -172,6 +172,7 @@ def decode_dense(
             input_layout="BNSD",
             scale_value=scale,
         )
+        return result[0] if isinstance(result, (tuple, list)) else result
     except (AttributeError, TypeError):
         # API 名 / 签名不可用时退到 npu_fusion_attention
         return dense_attention(q, k_cache, v_cache, scale=scale, causal=False)

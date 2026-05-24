@@ -131,21 +131,24 @@ def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim: int = 
 
 
 def init_minference_parameters(self) -> None:
+    if getattr(self, '_minference_initialized', False):
+        return
     config = self.config.to_dict()
     self.starting_layer = config.get("starting_layer", 0)
     self.is_search = config.get("is_search", False)
     self.ne_inf = None
     self.config_path = config.get("config_path", "")
 
-    if (
-        self.config_path
-        and os.path.exists(self.config_path)
-        and self.layer_idx < len(json.load(open(self.config_path)))
-    ):
-        self.best_pattern = {
-            int(ii): jj
-            for ii, jj in json.load(open(self.config_path))[self.layer_idx].items()
-        }
+    if self.config_path and os.path.exists(self.config_path):
+        with open(self.config_path) as f:
+            all_patterns = json.load(f)
+        if self.layer_idx < len(all_patterns):
+            self.best_pattern = {
+                int(ii): jj
+                for ii, jj in all_patterns[self.layer_idx].items()
+            }
+        else:
+            self.best_pattern = {}
     else:
         self.best_pattern = {}
     self.vertical, self.slash = None, None
@@ -157,6 +160,7 @@ def init_minference_parameters(self) -> None:
             import_module(model_path), "apply_rotary_pos_emb"
         )
         self.apply_rotary_pos_emb = True
+    self._minference_initialized = True
 
 
 # ----------------------------------------------------------------------------

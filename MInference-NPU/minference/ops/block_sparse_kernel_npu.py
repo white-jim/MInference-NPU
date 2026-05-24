@@ -224,16 +224,28 @@ def _block_sparse_npu(
 
     mask = _build_block_sparse_mask(q, k, topk_blocks, block_size)  # [B, H, S_q, S_k] bool
 
-    result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-        q,
-        k,
-        v,
-        head_num=n_heads,
-        input_layout="BNSD",
-        scale=scale,
-        sparse_mode=1,      # user-provided mask
-        atten_mask=mask,    # True = masked out
-    )
+    try:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,      # user-provided mask
+            atten_mask=mask,    # True = masked out
+        )
+    except TypeError:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=mask.to(torch.uint8),
+        )
     # npu_fusion_attention 返回元组 (out, softmax_max, softmax_sum, ...)
     return result[0] if isinstance(result, (tuple, list)) else result
 
@@ -274,9 +286,9 @@ def block_sparse_attention(
         3. 追加 per-token 因果约束保证对角块内正确性。
     """
     assert q.dim() == 4, f"q 期望 4D [B,H,S,D]，得到 {q.dim()}D"
-    assert q.shape == k.shape == v.shape, (
-        f"q/k/v 形状必须一致；q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
-    )
+    assert (
+        q.shape[0] == k.shape[0] and q.shape[1] == k.shape[1] and q.shape[-1] == k.shape[-1]
+    ), f"q/k B/H/D 不匹配；q={tuple(q.shape)} k={tuple(k.shape)}"
 
     topk_blocks = max(1, int(topk_blocks))  # 防止 ≤ 0
 

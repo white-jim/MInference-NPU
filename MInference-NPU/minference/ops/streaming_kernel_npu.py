@@ -239,24 +239,33 @@ def _streaming_npu(
     # NPU atten_mask 约定：True / 1 = 屏蔽
     attn_mask = (~allowed).to(torch.bool)[None, None, :, :]  # [1, 1, s_q, n_init_clamped]
 
-    # 如果**整张 mask 都是 True**（早期 query 全部无 sink 贡献），直接返回 o1（避免 NPU 上
-    # 整行 -inf 触发 NaN）
-    if bool(attn_mask.all().item()):
-        return o1
-
-    pass2 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-        q,
-        k_sink,
-        v_sink,
-        head_num=n_heads,
-        input_layout="BNSD",
-        scale=scale,
-        sparse_mode=1,  # user-provided mask
-        atten_mask=attn_mask,
-    )
+    try:
+        pass2 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k_sink,
+            v_sink,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,  # user-provided mask
+            atten_mask=attn_mask,
+        )
+    except TypeError:
+        pass2 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k_sink,
+            v_sink,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=attn_mask.to(torch.uint8),
+        )
     o2 = pass2[0]
     m2 = _take_first_lane(pass2[1])
     l2 = _take_first_lane(pass2[2])
+    # 全行被 mask 时 torch_npu 可能返回 NaN；nan_to_num 使 LSE 合并退化为 o1
+    l2 = torch.nan_to_num(l2, nan=0.0)
 
     # --- 跨段 log-sum-exp 合并 ---
     # NPU FA 返回：m = max(scaled_logits)，l = sum(exp(scaled_logits - m))。
@@ -310,9 +319,9 @@ def streaming_forward(
       实现上转到 ``backend_npu.dense_attention`` / PyTorch dense。
     """
     assert q.dim() == 4, f"q 期望 4D [B,H,S,D]，得到 {q.dim()}D"
-    assert q.shape == k.shape == v.shape, (
-        f"q/k/v 形状必须一致；得到 q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
-    )
+    assert (
+        q.shape[0] == k.shape[0] and q.shape[1] == k.shape[1] and q.shape[-1] == k.shape[-1]
+    ), f"q/k B/H/D 不匹配；q={tuple(q.shape)} k={tuple(k.shape)}"
 
     head_d = q.shape[-1]
     orig_head_d = head_d

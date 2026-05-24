@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。读这一份就能接着干，不必重新探索代码库。
-> 创建日期：2026-05-23（最近更新：2026-05-23，已完成 M0 + M1 + M2 + M3 + **M4 全部步骤**（convert_vertical_slash_indexes CPU Python + vertical-slash NPU kernel + 接入 + 单测 + 文档）；**代码审查已完成，发现 3 个必现崩溃 + 2 个潜在崩溃 + 4 个性能大坑，见 §11**，下一步：先 Bug 修复（§11 B1/B2/B3/P3/B4/P4），再 M5 端到端联调）
+> 创建日期：2026-05-23（最近更新：2026-05-24，已完成 M0 + M1 + M2 + M3 + **M4 全部步骤**（convert_vertical_slash_indexes CPU Python + vertical-slash NPU kernel + 接入 + 单测 + 文档）；**Bug 修复已完成**：B1/B2/B3/B4/B5/P3/P4 全部修正（见 §11）；**新增静态审查问题**：B6/B7/B8/B9/P5/P6/P7/P8/P9 待处理（见 §12），下一步：先修 B6/B7/B8，再进入 M5 端到端联调）
 > 工作目录：`D:\tempt\算法迁移\`（本次会话）
 
 ---
@@ -160,7 +160,7 @@
 [x] M3 Block-Sparse kernel           ← 已完成（步骤 1-4 全部完成）
 [x] M4-a convert_vertical_slash_indexes  ← 已完成（CPU Python 双指针，与 CUDA kernel 等价）
 [x] M4-b Vertical-Slash 主 kernel    ← 已完成（cumsum mask + npu_fusion_attention + 在线估计接入）
-[ ] Bug 修复（代码审查发现 3 个必现崩溃 + 2 个潜在崩溃，见 §11）← 下一步，优先于 M5
+[x] Bug 修复（B1/B2/B3/B4/B5/P3/P4 全部修正，2026-05-24）
 [ ] M5 端到端联调 + 精度/性能/效果
 [ ] migration_v1_notes.md + migration_v1_report.md
 ```
@@ -332,7 +332,7 @@ M5 不引入新代码，主要是实机验证：
   blk_ends   = (blk_starts + block_size).clamp(max=S_k)
   cols = column_index[b, h, bq, :ncol].long().to(device).clamp(0, S_k - 1)
   ```
-- **状态**：`[ ]`
+- **状态**：`[x]` 已修复（2026-05-24）
 
 #### B2 — `decode_dense`：`npu_incre_flash_attention` 返回值未解包
 - **文件**：`minference/backend_npu/attention.py:167-174`
@@ -342,7 +342,7 @@ M5 不引入新代码，主要是实机验证：
   result = torch_npu.npu_incre_flash_attention(q, k_cache, v_cache, ...)
   return result[0] if isinstance(result, (tuple, list)) else result
   ```
-- **状态**：`[ ]`
+- **状态**：`[x]` 已修复（2026-05-24）
 
 #### B3 — `seqlens` 硬编码 batch=1，B>1 时越界
 - **文件**：`minference/ops/vertical_slash_kernel_npu.py:189`（`_vertical_slash_pytorch_ref`）和 `:234`（`_vertical_slash_npu`）
@@ -351,7 +351,7 @@ M5 不引入新代码，主要是实机验证：
   ```python
   seqlens = torch.tensor([S_k] * B, dtype=torch.int32)
   ```
-- **状态**：`[ ]`
+- **状态**：`[x]` 已修复（2026-05-24）
 
 ---
 
@@ -365,13 +365,13 @@ M5 不引入新代码，主要是实机验证：
   assert q.dim() == 4
   assert q.shape[0] == k.shape[0] and q.shape[1] == k.shape[1] and q.shape[-1] == k.shape[-1]
   ```
-- **状态**：`[ ]`
+- **状态**：`[x]` 已修复（2026-05-24）
 
 #### B5 — `atten_mask` 传 `bool` dtype，部分 torch_npu 版本要求 `uint8`
 - **文件**：`block_sparse_kernel_npu.py:235`，`vertical_slash_kernel_npu.py:250`，`streaming_kernel_npu.py:255`
 - **根因**：三个 kernel 均将 `torch.bool` mask 传给 `npu_fusion_attention(sparse_mode=1, atten_mask=mask)`。torch_npu 部分版本的 `npu_fusion_attention` 对 `atten_mask` 的 dtype 有严格要求（需 `uint8` 而非 `bool`），传 `bool` 会 TypeError。
-- **修复**：实机验证后按实际 torch_npu 版本决定；建议统一加 `.to(torch.bool)` 或 `.to(torch.uint8)` 后再传入，并在 `SETUP.md` 中记录版本约束。
-- **状态**：`[ ]`
+- **修复**：三处 NPU 调用均先按 `torch.bool` mask 调用；若 torch_npu 小版本因 dtype 抛 `TypeError`，自动用 `mask.to(torch.uint8)` 重试。
+- **状态**：`[x]` 已修复（2026-05-24）
 
 ---
 
@@ -400,18 +400,13 @@ M5 不引入新代码，主要是实机验证：
       ...  # 原有逻辑，open 改成 with open(...) as f: data = json.load(f)
       self._minference_initialized = True
   ```
-- **状态**：`[ ]`
+- **状态**：`[x]` 已修复（2026-05-24）
 
 #### P4 — `attn_mask.all().item()` 强制 NPU-CPU 同步
 - **文件**：`minference/ops/streaming_kernel_npu.py:244`
 - **根因**：`if bool(attn_mask.all().item()):` 中 `attn_mask` 在 NPU 上，`.item()` 强制将结果从 NPU 搬回 CPU，阻塞 NPU 异步执行流水线，每次推理必然产生一次 NPU-CPU 同步等待。
-- **修复**：改为在 CPU 侧用纯 Python 数值判断——当 `s_k - s_q < n_local`（即所有 query 的 sliding window 已覆盖从 0 开始的全部 sink）时才跳过段 2，不需要真正构建 mask 后检查：
-  ```python
-  # 若最早的 query（abs_pos = s_k - s_q）的 sliding window 左边界 <= 0，则没有 sink 贡献
-  if (s_k - s_q) - int(n_local) + 1 <= 0:
-      return o1
-  ```
-- **状态**：`[ ]`
+- **修复**：删除 `attn_mask.all().item()` 同步判断；在当前外层已保证 `s_k > n_local` 且 `n_init > 0` 的主路径下，该整张 mask 全 True 分支不可达。为防 torch_npu 对全 mask 行返回 NaN，保留 `l2 = torch.nan_to_num(l2, nan=0.0)`，LSE 合并会自然退化为 `o1`。
+- **状态**：`[x]` 已修复（2026-05-24）
 
 ---
 
@@ -425,6 +420,111 @@ M5 不引入新代码，主要是实机验证：
 | P1（较早改） | P3 | ~10 行 | 最容易改的性能问题，每次推理必触发 |
 | P1（较早改） | B4 | 4 行 | 有 KV cache 时触发，KV cache 场景常见 |
 | P1（较早改） | P4 | 3 行 | 热路径同步，简单修复 |
-| P2（实机验证时） | B5 | 1 行/处 | 实机才能确认是否触发 |
+| P1（已修复） | B5 | 3 处 | 已加 bool→uint8 TypeError retry，实机仍需确认最佳 dtype |
 | P3（性能优化阶段） | P1 | 大重构 | 向量化 mask 构建，M5 性能测试后再做 |
 | P3（性能优化阶段） | P2 | 大重构 | 向量化 convert_vertical_slash_indexes |
+
+---
+
+## 12. 代码审查结果（2026-05-24，第二轮静态审查）
+
+> 审查范围：`MInference-NPU/MInference-NPU/minference/backend_npu/attention.py`、`backend_npu/cuda_shim.py`、`modules/minference_forward.py`、`ops/*_kernel_npu.py`、`patch.py`、`models_patch.py`、`tests/test_dense_forward.py` 与 M2/M3/M4 文档。
+> 本轮仅做 Windows 开发机上的静态审查与 UTF-8 syntax check；由于本机无 torch/NPU 环境，未宣称实机跑通。
+> Syntax check 通过：`attention.py / cuda_shim.py / minference_forward.py / streaming_kernel_npu.py / block_sparse_kernel_npu.py / vertical_slash_kernel_npu.py / patch.py / models_patch.py / __init__.py`。
+
+### 12.1 高优先级崩溃 / 端到端不可用风险
+
+#### B6 — 新版 Transformers attention forward / RoPE 接口不兼容
+- **文件**：`minference/modules/minference_forward.py:81`、`:158`、`:284`、`:331`
+- **根因**：当前 patched `forward()` 仍采用旧式 LlamaAttention 签名，并直接依赖 `self.rotary_emb`。较新版 transformers 的 Llama/Qwen attention 可能由外层传入 `position_embeddings=(cos, sin)`，且 `self_attn` 内不再持有 `self.rotary_emb`。
+- **触发条件**：使用较新版 transformers（尤其 `position_embeddings` 路径）加载 Llama/Qwen/Mistral family 后调用 patched forward。
+- **后果**：首次 forward 可能 `TypeError`（缺少旧式位置参数）或 `AttributeError: ... has no attribute rotary_emb`。
+- **修复建议**：
+  ```python
+  def forward(..., position_embeddings=None, cache_position=None, **kwargs):
+      if position_embeddings is not None:
+          cos, sin = position_embeddings
+      else:
+          # 仅旧版 HF 走 self.rotary_emb 探测与 get_cos_sin
+  ```
+  同时无 `self.rotary_emb` 时不要在 `init_minference_parameters()` 中导入其模块的 `apply_rotary_pos_emb`。
+- **状态**：`[ ]`
+
+#### B7 — `attn_type="dense"` 未真正强制 dense，误入 vertical/slash 稀疏路径
+- **文件**：`minference/models_patch.py:93-96`、`minference/patch.py:75-76`、`minference/modules/minference_forward.py:254-268`、`:374-380`
+- **根因**：`models_patch.py` 注释称 dense 模式所有 head 走 dense，但 `patch.py` 只注入 `starting_layer/config_path`，未注入 `attn_type`。`dense` 默认 `starting_layer=-1`，因此 prefill 会进入 `gather_last_q_vertical_slash_topk_v4()`；无 best_pattern 时又默认 `("vertical_and_slash", 1000, 6096, 1)`。
+- **触发条件**：`MInference(attn_type="dense")(model)`，包括 `tests/test_dense_forward.py:100` 和多卡 smoke。
+- **后果**：dense smoke 不再是裸 dense；会构建 vertical/slash 索引与 token mask，可能引入 OOM、NPU sparse mask 报错或严重变慢；测试语义也不对。
+- **修复建议**：在 `minference_patch()` 中注入 `model.config.attn_type = config.attn_type`；`init_minference_parameters()` 读取 `self.attn_type`；`forward()` 在 prefill 阶段优先判断 `attn_type == "dense"`，直接调用 `dense_attention()`，不要进入 per-head sparse 调度。
+- **状态**：`[ ]`
+
+#### B8 — Streaming NPU 路径假设 `npu_fusion_attention` 一定返回 softmax 统计量
+- **文件**：`minference/ops/streaming_kernel_npu.py:220-222`、`:264-266`
+- **根因**：`_streaming_npu()` 直接索引 `pass1[1]/pass1[2]` 与 `pass2[1]/pass2[2]`，默认返回 tuple/list 且包含 `softmax_max/softmax_sum`。不同 torch_npu 小版本可能只返回 output tensor，或 tuple 长度/语义不同。
+- **触发条件**：目标 NPU 环境的 `torch_npu.npu_fusion_attention` 返回格式与当前假设不一致。
+- **后果**：`IndexError`、把 tensor 第 0 维误当返回项导致 shape 错，或 LSE 合并崩溃。
+- **修复建议**：显式校验 `isinstance(result, (tuple, list)) and len(result) >= 3`；若不可用，fallback 到一次性 user-mask attention、dense fallback 或直接抛带版本信息的清晰错误。
+- **状态**：`[ ]`
+
+#### B9 — `q_len < k_len` 的 chunked prefill / cache 场景 causal offset 不一致
+- **文件**：`minference/modules/minference_forward.py:212-238`、`minference/ops/vertical_slash_kernel_npu.py:154`、`minference/ops/block_sparse_kernel_npu.py:139-162`
+- **根因**：streaming 路径明确用 `abs_i = S_k - S_q + i`，但 vertical/slash mask 使用 `j <= q_rows`，block-sparse block 级 causal 使用 `bq >= bk`，均未统一加入 KV cache offset。`_vertical_and_slash_kernel()` 中 `s_idx = (q_len - 1) - s_raw_idx` 在 `S_k != q_len` 时语义也可疑。
+- **触发条件**：full prefill 以外的 chunked prefill、prefill with past、或任何 `S_q != S_k` 且 `q_len != 1` 的路径。
+- **后果**：普通 full prefill 不受影响；chunked/cache prefill 可能输出错误，稀疏 pattern 也可能异常。
+- **修复建议**：v1 若只支持 full prefill + q_len=1 decode，应显式断言 `S_q == S_k`；若要支持 chunked prefill，所有 mask 与 slash index 都统一使用 `q_offset = S_k - S_q`。
+- **状态**：`[ ]`
+
+### 12.2 重大性能 / OOM 风险
+
+#### P5 — Vertical-slash CPU Python index convert 仍是主路径性能大坑
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:234-237`、`minference/backend_npu/cuda_shim.py:201-231`
+- **根因**：每次 vertical/slash attention 都将 `v_idx/s_idx` 从 NPU 拷到 CPU 并 `.tolist()`，然后在 `B × H × num_rows` 三层 Python 循环中运行双指针扫描，循环内还创建小 tensor 写回。
+- **规模估算**：默认 `NNZ_V≈1000`、`NNZ_S≈6096`。128k 序列 `num_rows≈2000`，32 heads 下是 `32 × 2000 × ~7000` 级 Python 操作，且包含 NPU→CPU 同步。
+- **后果**：长上下文 prefill 可能被 CPU Python convert 主导，明显偏离 MInference 加速目标。
+- **修复建议**：短期用 NumPy/C++/Cython 向量化并减少循环内 tensor 分配；中期回到原方案，用 Triton-Ascend/AscendC 实现 index convert。
+- **状态**：`[ ]`
+
+#### P6 — M3/M4 展开 token 级 `[B,H,S_q,S_k]` bool mask，16k 已很重
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:109-159`、`minference/ops/block_sparse_kernel_npu.py:145-165`
+- **根因**：block-sparse 与 vertical/slash 当前都走 `npu_fusion_attention(sparse_mode=1, atten_mask=mask)`，mask 是 token 级二维展开，而不是直接消费 block/index 稀疏描述。
+- **规模估算**：单 head `S=16384` 的 bool mask 约 256MiB；32 heads 若批量化则约 8GiB，当前 per-head 循环也会反复构建/释放大 mask。block-sparse 的 `expand().reshape()` 可能物化大张量。
+- **后果**：8k 以内可用于 correctness smoke；16k 性能和内存压力已大；32k/128k 不适合性能验收。
+- **修复建议**：M3/M4 性能路径应改为真正的块/索引稀疏 kernel（TileLang/Triton-Ascend/AscendC），避免 token mask 展开。
+- **状态**：`[ ]`
+
+#### P7 — 超过 16384 后 silent dense fallback，长上下文性能测试会失真
+- **文件**：`minference/ops/vertical_slash_kernel_npu.py:324-335`、`minference/ops/block_sparse_kernel_npu.py:308-319`
+- **根因**：`S > _MAX_SEQ_FOR_MASK` 时发 warning 后直接退化为 `dense_attention()`。vertical/slash 路径还会先在 `minference_forward.py:217-238` 完成 QK/topk 在线估计，再 fallback dense。
+- **触发条件**：32k/128k 长上下文，这是迁移目标场景。
+- **后果**：实际复杂度退化为 O(S²) dense，128k 基本不可用；M5 若未检查 warning，会误以为在测 sparse kernel 性能。
+- **修复建议**：对 `attn_type="minference"` 的性能验收路径，超过阈值不应 silent dense fallback；要么明确报错，要么要求启用真正 sparse kernel。smoke-only fallback 可保留但必须在报告中标注。
+- **状态**：`[ ]`
+
+#### P8 — Prefill per-head 循环造成大量 NPU kernel launch
+- **文件**：`minference/modules/minference_forward.py:368-382`
+- **根因**：每层每 head 单独切片并调用 attention kernel；streaming head 至少两次 `npu_fusion_attention`，M3/M4 还会每 head 构建 mask。
+- **规模估算**：32 layers × 32 heads 可达上千次小 kernel launch；NPU launch 固定开销会被放大。
+- **修复建议**：按 pattern 类型与参数分组，把相同 pattern 的 heads 批量传入 NPU op；dense 与 streaming 分支可以优先合并。
+- **状态**：`[ ]`
+
+#### P9 — GQA/MQA 的 `repeat_kv` 放大 KV 与后续 mask/attention 工作量
+- **文件**：`minference/modules/minference_forward.py:351-354`
+- **根因**：`repeat_kv()` 将 KV heads 物理复制到 Q heads 数量。对 GQA/MQA 模型，KV 带宽、mask 构建和 attention 工作量都会按 `num_key_value_groups` 放大。
+- **触发条件**：Qwen/Llama 等 GQA 模型。
+- **后果**：correctness 路径可接受，但性能路径会显著偏慢、占用更多 HBM。
+- **修复建议**：性能阶段让 NPU op 支持 KV heads 少于 Q heads，kernel 内按 group 映射，避免物理 repeat。
+- **状态**：`[ ]`
+
+### 12.3 建议修复顺序
+
+| 优先级 | 编号 | 估计改动量 | 说明 |
+|---|---|---|---|
+| P0 | B6 | 中 | 不修可能端到端首次 forward 直接挂；先兼容新版 transformers/RoPE |
+| P0 | B7 | 小 | dense smoke 语义错误；会干扰 M5 基础链路验证 |
+| P1 | B8 | 小 | torch_npu 返回格式差异会导致 streaming NPU 崩溃 |
+| P1 | B9 | 小-中 | 若 v1 不支持 chunked prefill，先显式断言；否则统一 offset |
+| P2 | P7 | 小 | 性能测试前必须避免 silent dense fallback 误导结论 |
+| P2 | P5 | 大 | vertical/slash 长上下文性能瓶颈，需向量化或 NPU kernel |
+| P2 | P6 | 大 | token 级 mask 限制 M3/M4 性能上限 |
+| P3 | P8 | 中-大 | head 分组 batching 降低 launch 开销 |
+| P3 | P9 | 中-大 | GQA/MQA 性能优化，避免物理 repeat KV |

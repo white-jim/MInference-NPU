@@ -125,7 +125,7 @@ def _build_vs_mask_from_indexes(
                 nblk = int(block_count[b, h, bq].item())
                 slash_cov = torch.zeros(S_k, dtype=torch.bool, device=device)
                 if nblk > 0:
-                    blk_starts = block_offset[b, h, bq, :nblk].long()  # [nblk]
+                    blk_starts = block_offset[b, h, bq, :nblk].long().to(device)  # [nblk]
                     blk_ends = (blk_starts + block_size).clamp(max=S_k)  # [nblk]
                     # cumsum 区间标记：+1 at start, -1 at end
                     cov_delta = torch.zeros(S_k + 1, dtype=torch.int32, device=device)
@@ -143,7 +143,7 @@ def _build_vs_mask_from_indexes(
                 ncol = int(column_count[b, h, bq].item())
                 vert_cov = torch.zeros(S_k, dtype=torch.bool, device=device)
                 if ncol > 0:
-                    cols = column_index[b, h, bq, :ncol].long().clamp(0, S_k - 1)
+                    cols = column_index[b, h, bq, :ncol].long().to(device).clamp(0, S_k - 1)
                     vert_cov[cols] = True  # scatter set
 
                 # ---- 合并覆盖区域 ----
@@ -186,7 +186,7 @@ def _vertical_slash_pytorch_ref(
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
 
-    seqlens = torch.tensor([S_k], dtype=torch.int32)
+    seqlens = torch.tensor([S_k] * B, dtype=torch.int32)
     block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
         seqlens, v_idx.cpu(), s_idx.cpu(), S_k, block_size, block_size,
     )
@@ -231,7 +231,7 @@ def _vertical_slash_npu(
     S_k = k.shape[2]
     scale = D ** -0.5
 
-    seqlens = torch.tensor([S_k], dtype=torch.int32)
+    seqlens = torch.tensor([S_k] * B, dtype=torch.int32)
     block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
         seqlens, v_idx.cpu(), s_idx.cpu(), S_k, block_size, block_size,
     )
@@ -241,14 +241,24 @@ def _vertical_slash_npu(
         S_q, S_k, device=q.device, block_size=block_size,
     )  # [B, H, S_q, S_k] True=masked，NPU 惯例
 
-    result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-        q, k, v,
-        head_num=H,
-        input_layout="BNSD",
-        scale=scale,
-        sparse_mode=1,      # user-provided mask
-        atten_mask=mask,    # True = masked out
-    )
+    try:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q, k, v,
+            head_num=H,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,      # user-provided mask
+            atten_mask=mask,    # True = masked out
+        )
+    except TypeError:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q, k, v,
+            head_num=H,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=mask.to(torch.uint8),
+        )
     return result[0] if isinstance(result, (tuple, list)) else result
 
 
