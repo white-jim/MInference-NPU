@@ -216,32 +216,69 @@ def _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size):
     - 列和 → topk → v_idx（升序）。
     - 反对角线和 → topk → s_idx（降序，= q_len - 1 - diag_from_upper_right）。
     - 强制保留前 30 列（sink）和最近 100 条 slash（local window）。
+
+    v2 PR-1：``vertical_size`` / ``slash_size`` 同时接受标量与长度为 H 的 list/tuple/tensor。
+    传 list 时，每个 head 用各自的尺寸做 topk —— 通过先按 ``max(sizes)`` topk、再把
+    超出本 head 配额的位置替换为 ``[..., 0:1]`` 的重复值（shim 与 mask 构造都对重复索引
+    幂等），保证与 per-head 循环 bit-identical。
     """
-    q_len = q.shape[2]
-    vertical_size = min(q_len, max(int(vertical_size), 30))
-    slash_size = min(q_len, max(int(slash_size), 50))
+    B, H, q_len, _ = q.shape
     last_q = min(LAST_Q, q_len)
+    device = q.device
+
+    # ---- 归一化尺寸为长度 H 的 Python list（per-head clamp） ----
+    def _norm(sz, lower):
+        if isinstance(sz, (list, tuple)):
+            assert len(sz) == H, f"per-head size 长度 {len(sz)} != H {H}"
+            return [min(q_len, max(int(x), lower)) for x in sz]
+        if torch.is_tensor(sz):
+            assert sz.numel() == H, f"per-head size tensor numel {sz.numel()} != H {H}"
+            return [min(q_len, max(int(x), lower)) for x in sz.tolist()]
+        return [min(q_len, max(int(sz), lower))] * H
+
+    vs_per_h = _norm(vertical_size, 30)
+    ss_per_h = _norm(slash_size, 50)
+    V_max = max(vs_per_h)
+    S_max = max(ss_per_h)
 
     # QK 估计（仅用最后 last_q 个 query）
     qk = torch.matmul(q[:, :, -last_q:, :], k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
     # 因果 mask（[1,1,last_q,last_q] 的右下角）
-    lq_mask = _last_q_mask(q.device)[:, :, -last_q:, -last_q:]  # [1,1,last_q,last_q]
+    lq_mask = _last_q_mask(device)[:, :, -last_q:, -last_q:]  # [1,1,last_q,last_q]
     qk[:, :, :, -last_q:] = torch.where(lq_mask, qk[:, :, :, -last_q:], float("-inf"))
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)  # [B,H,last_q,q_len]
 
     # Vertical：列和 → topk（保留前 30 sink 列）
     vertical = qk.sum(-2, keepdim=True)              # [B,H,1,q_len]
     vertical[..., :30] = torch.inf                   # 强制保留 sink
-    v_idx = torch.topk(vertical, vertical_size, dim=-1).indices  # [B,H,1,V]
-    v_idx = v_idx.reshape(q.shape[0], q.shape[1], -1)            # [B,H,V]
-    v_idx = v_idx.sort(dim=-1, descending=False).values.to(torch.int32)  # [B,H,V] 升序
+    v_idx = torch.topk(vertical, V_max, dim=-1).indices  # [B,H,1,V_max]
+    v_idx = v_idx.reshape(B, H, V_max)               # [B,H,V_max]
+
+    # per-head trim：head h 只想要前 vs_per_h[h] 项，余下位置改写为 v_idx[..., 0:1]
+    # （shim 的 col_buf 对重复列幂等，mask scatter True 也幂等 → bit-identical）
+    if any(x != V_max for x in vs_per_h):
+        vs_t = torch.tensor(vs_per_h, device=device).view(1, H, 1)
+        arange_v = torch.arange(V_max, device=device).view(1, 1, V_max)
+        valid_v = arange_v < vs_t                    # [1,H,V_max]
+        v_idx = torch.where(valid_v, v_idx, v_idx[..., 0:1])
+
+    v_idx = v_idx.sort(dim=-1, descending=False).values.to(torch.int32)  # 升序
 
     # Slash：反对角线和 → topk（保留最近 100 条 local）
     slash_diag = sum_all_diagonal_matrix(qk)[..., :-last_q + 1]  # [B,H,q_len]
     slash_diag[..., -100:] = torch.inf                            # 强制保留 local
-    s_raw_idx = torch.topk(slash_diag, slash_size, dim=-1).indices  # [B,H,S]
-    s_idx = (q_len - 1) - s_raw_idx                               # 转换为上游约定
-    s_idx = s_idx.sort(dim=-1, descending=True).values.to(torch.int32)  # [B,H,S] 降序
+    s_raw_idx = torch.topk(slash_diag, S_max, dim=-1).indices    # [B,H,S_max]
+    s_idx = (q_len - 1) - s_raw_idx                               # 上游约定
+
+    # per-head trim：与 vertical 同样思路。slash 重复值在 _process_block 的 else
+    # 分支（new_range_end <= range_end）会被跳过，不影响 block_offset。
+    if any(x != S_max for x in ss_per_h):
+        ss_t = torch.tensor(ss_per_h, device=device).view(1, H, 1)
+        arange_s = torch.arange(S_max, device=device).view(1, 1, S_max)
+        valid_s = arange_s < ss_t                    # [1,H,S_max]
+        s_idx = torch.where(valid_s, s_idx, s_idx[..., 0:1])
+
+    s_idx = s_idx.sort(dim=-1, descending=True).values.to(torch.int32)  # 降序
 
     return _vs_sparse_attention(q, k, v, v_idx, s_idx)
 
@@ -418,23 +455,76 @@ def minference_forward():
                 output = dense_attention(
                     query_states, key_states, value_states, causal=True
                 )
+            elif self.layer_idx < self.starting_layer or self.is_search:
+                # 起始层 / search 模式：整层走 dense（不走 per-head 循环）
+                output = dense_attention(
+                    query_states, key_states, value_states, causal=True
+                )
             else:
-                # prefill：起始层走 dense，之后按 best_pattern 分头
-                output = torch.empty_like(query_states)
-                for head in range(query_states.size(1)):
-                    q = query_states[:, head, :, :].unsqueeze(1)
-                    k = key_states[:, head, :, :].unsqueeze(1)
-                    v = value_states[:, head, :, :].unsqueeze(1)
-
-                    if self.layer_idx >= self.starting_layer and not self.is_search:
-                        attn_output = gather_last_q_vertical_slash_topk_v4(
-                            self, q, k, v, head
-                        )
+                # v2 PR-1：按 best_pattern 类型分组，vertical_and_slash heads 一次性
+                # batched 调用 _vertical_and_slash_kernel，消除 per-head Python 循环。
+                # stream_llm / block_sparse 暂保持 per-head（占比 < 5%，PR-2 再 batch）。
+                H = query_states.size(1)
+                vs_heads: list[int] = []
+                vs_v_sizes: list[int] = []
+                vs_s_sizes: list[int] = []
+                stream_calls: list[tuple[int, int, int]] = []
+                block_calls: list[tuple[int, int]] = []
+                for head in range(H):
+                    ty, vsz, ssz, _ = self.best_pattern.get(
+                        head, ("vertical_and_slash", 1000, 6096, 1)
+                    )
+                    if ty == "vertical_and_slash":
+                        vs_heads.append(head)
+                        vs_v_sizes.append(int(vsz))
+                        vs_s_sizes.append(int(ssz))
+                    elif ty == "stream_llm":
+                        stream_calls.append((head, int(vsz), int(ssz)))
+                    elif ty == "block_sparse":
+                        block_calls.append((head, int(vsz)))
                     else:
-                        # 起始层 / search 模式 → dense
-                        attn_output = dense_attention(q, k, v, causal=True)
+                        raise ValueError(
+                            f"未知 best_pattern 类型 {ty!r}（layer={self.layer_idx} head={head}）"
+                        )
 
-                    output[:, head : head + 1] = attn_output
+                output = torch.empty_like(query_states)
+
+                # vertical_and_slash: batched（PR-1 主路径）
+                if vs_heads:
+                    if len(vs_heads) == H:
+                        # 全部 head 都是 VS：跳过 index_select / index_copy_ 直接整张量
+                        out_vs = _vertical_and_slash_kernel(
+                            self, query_states, key_states, value_states,
+                            vs_v_sizes, vs_s_sizes,
+                        )
+                        output = out_vs
+                    else:
+                        head_idx_t = torch.tensor(
+                            vs_heads, device=query_states.device, dtype=torch.long
+                        )
+                        q_vs = query_states.index_select(1, head_idx_t)
+                        k_vs = key_states.index_select(1, head_idx_t)
+                        v_vs = value_states.index_select(1, head_idx_t)
+                        out_vs = _vertical_and_slash_kernel(
+                            self, q_vs, k_vs, v_vs, vs_v_sizes, vs_s_sizes,
+                        )
+                        output.index_copy_(1, head_idx_t, out_vs)
+
+                # stream_llm / block_sparse: per-head（PR-2 再 batch）
+                for head, n_init, n_local in stream_calls:
+                    q = query_states[:, head : head + 1]
+                    k = key_states[:, head : head + 1]
+                    v = value_states[:, head : head + 1]
+                    output[:, head : head + 1] = _streaming_forward(
+                        q, k, v, n_init=n_init, n_local=n_local
+                    )
+                for head, topk in block_calls:
+                    q = query_states[:, head : head + 1]
+                    k = key_states[:, head : head + 1]
+                    v = value_states[:, head : head + 1]
+                    output[:, head : head + 1] = _block_sparse_attention(
+                        q, k, v, topk_blocks=topk
+                    )
         else:
             # decode 路径：一次性整 head 调用，不走 per-head 循环（与上游 line 584 一致）
             output = decode_dense(query_states, key_states, value_states)

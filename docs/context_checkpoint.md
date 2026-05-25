@@ -1,8 +1,8 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — **v1 收尾完毕，v2 启动**。已锁定 CANN 8.2.RC1 + torch/torch_npu 2.6.0 升级方案，`MInference-NPU/requirements.txt` 已改，等用户实机升 CANN + 建新 env 后回来。**回来第一件事是复测 `sparse_mode=2/4` 行为表**（见 §11）。
-> 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
+> 最近更新：2026-05-25 — **v2 启动，分支 B 确认**。CANN 8.2.RC1 + torch/torch_npu 2.6.0 已升级完，全套 M1~M5 单测在新环境零回归（93 passed），但 `sparse_mode=2/4` 复测**仍未修复**（详见 §9.1 / §9.3 实测表），v2 走分支 B：O(S²) mask 留着，焦点收敛到消除 per-head Python 循环。
+> 工作目录：`D:\tempt\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
 
@@ -128,22 +128,29 @@ M5 不引入新代码，只做实机验证：
 
 ## 9. M5 实机踩坑记录
 
-### 9.1 `npu_fusion_attention` 的 `sparse_mode` 在 CANN 8.1.RC1 下不靠谱（2026-05-25）
+### 9.1 `npu_fusion_attention` 的 `sparse_mode` quirk（CANN 8.1.RC1 首发，8.2.RC1 仍存在）
 
 **触发**：`python tests/test_env.py -v` 中 `test_npu_fusion_attention_smoke` FAIL，`max_abs_diff=3.633e+00`，差异跟"causal 期望 vs full attention 实测"对得上。
 
 **实测组合**（B=1, N=4, S=256, D=128, fp16，与手写 PyTorch eager causal 比对）：
 
-| 调用 | `max_abs_diff` | 实际语义 |
-|---|---|---|
-| `sparse_mode=0`（无 mask） | ~3.6 | full attention |
-| `sparse_mode=2`（无 mask） | ~3.6 | full attention（**不是** causal） |
-| `sparse_mode=2 + pre_tockens/next_tockens` | ~3.6 | full attention |
-| `sparse_mode=1 + 显式 [S_q, S_k] bool atten_mask` | ~0.00195（mean ~2e-5） | 正确 causal |
+| 调用 | `max_abs_diff`（8.1.RC1） | `max_abs_diff`（8.2.RC1） | 实际语义 |
+|---|---|---|---|
+| `sparse_mode=0`（无 mask） | ~3.6 | ~3.6 | full attention |
+| `sparse_mode=2`（无 mask） | ~3.6 | **3.633e+00** | full attention（**不是** causal） |
+| `sparse_mode=2 + pre_tockens/next_tockens` | ~3.6 | — | full attention |
+| `sparse_mode=4 + pre_tockens=W-1, next_tockens=0` | ~3.6 | **3.633e+00**（vs full=**2.441e-04**）| full attention（**不是** sliding-window band） |
+| `sparse_mode=1 + 显式 [S_q, S_k] bool atten_mask` | ~0.00195（mean ~2e-5） | **1.953e-03** | 正确 causal |
 
 **修正**：路径 A 全部 causal 调用改走 `sparse_mode=1 + 显式 bool atten_mask`（`True=masked`，与 M3/M4 既有约定一致），`try/except TypeError` 兜底 uint8。已修 `backend_npu/attention.py::dense_attention` + `tests/test_env.py` + `docs/SETUP.md` §5/§5.1。修正后实机 smoke max_abs_diff=1.953e-03，PASS。
 
-**仍需盯**：`streaming_kernel_npu.py` 的 sliding-window 段用 `sparse_mode=4`，未单独实测过同类问题，跑 `tests/test_streaming_kernel.py` 时复核精度。CANN 升到 8.2+ 时可复测 `sparse_mode=2` 决定是否回滚省 mask 显存。
+**CANN 8.2.RC1 复测结论（2026-05-25 由 `tests/test_sparse_mode_quirk.py` 实测）**：
+- sm2 仍退化为 full attention（与 8.1 同症）
+- sm4 同样退化为 full attention，且 `out_npu` 与 full attention 输出 `max_abs=2.441e-04` 几乎 bit-identical，**确证 `pre_tockens / next_tockens` 在 8.2.RC1 下被无视**
+- baseline sm1 + 显式 mask 仍精度正确
+- v2 路线确定为**分支 B**：O(S²) mask 必须留着，CANN 升级无法自动解决 128K OOM
+
+**仍需盯**：CANN 升到 8.3+ 时可再复测，命中后回滚省 mask 显存（届时跑 `tests/test_sparse_mode_quirk.py` 即可）。在 8.2.RC1 上：v1 现有显式 mask 路线零回归（M1~M5 单测 93 passed），不必改。
 
 ### 9.2 transformers 4.57.3 attention forward 签名变更（2026-05-25）
 
@@ -171,7 +178,9 @@ M5 不引入新代码，只做实机验证：
 
 **显存代价**：mask `[1,1,S_q,S_k]` 在 S=16384 内单测无压力；S>16384 已由 P7 silent dense fallback 兜底，本次不动。CANN 升 8.2+ 时可复测 `sparse_mode=4`，命中后回滚省 mask。
 
-**仍需盯**：M3 block-sparse / M4 vertical-slash 的 NPU 段已经全程显式 mask，理论上不踩此坑；M5 跑 `tests/test_block_sparse_kernel.py` + `tests/test_vertical_slash_kernel.py` 时确认。
+**CANN 8.2.RC1 复测结论（2026-05-25）**：sparse_mode=4 在 8.2.RC1 下仍退化为 full attention（与 §9.1 sm2 表同源），段 1 显式 mask 不能回滚。详见 §9.1 行为表。
+
+**仍需盯**：M3 block-sparse / M4 vertical-slash 的 NPU 段已经全程显式 mask，理论上不踩此坑；M5 跑 `tests/test_block_sparse_kernel.py` + `tests/test_vertical_slash_kernel.py` 时确认。CANN 8.2.RC1 升级后 M5 全套 93 passed 已复核（2026-05-25）。
 
 ### 9.4 【v1 最大设计代价】minference per-head Python 循环 host-bound（2026-05-25）
 
@@ -244,41 +253,39 @@ M5 不引入新代码，只做实机验证：
 5. `pip install -r requirements.txt && pip install -e .`
 6. 三层校验：`torch.npu.is_available()`、`python tests/test_env.py`、`pytest tests/`（全套 M1~M5 单测）
 
-### 11.2 升完回来第一件事：复测 `sparse_mode` 行为表（**v2 P0 路径分叉点**）
+### 11.2 升完回来第一件事：复测 `sparse_mode` 行为表（**已执行 2026-05-25，分支 B 确认**）
 
-写一个最小测试逐项验证（B=1, N=4, S=256, D=128, fp16，对照手写 PyTorch eager causal/band）：
+复测脚本 `tests/test_sparse_mode_quirk.py`（B=1, N=4, S=256, D=128, fp16，对照手写 PyTorch eager causal/band），实测结果：
 
-| 调用 | 期望（修复后） | 影响 |
-|---|---|---|
-| `sparse_mode=2` 无 mask | causal，`max_abs_diff < 1e-2` | 若 ✅ → 路径 A 可省 `[S_q,S_k]` mask |
-| `sparse_mode=4 + pre_tockens, next_tockens=0` | sliding-window band | 若 ✅ → streaming kernel 段 1 可回滚省 mask |
-| `sparse_mode=1 + 显式 mask` | 保持正确 | 兜底路径，预期不变 |
+| 调用 | 期望（修复后） | 实测（CANN 8.2.RC1） | 影响 |
+|---|---|---|---|
+| `sparse_mode=2` 无 mask | causal | ❌ `max_abs=3.633e+00`，仍是 full | 路径 A mask 不能去 |
+| `sparse_mode=4 + pre_tockens, next_tockens=0` | sliding-window band | ❌ `max_abs=3.633e+00`，与 full 几乎 bit-identical（vs full=2.441e-04）| streaming 段 1 mask 不能去 |
+| `sparse_mode=1 + 显式 mask` | 保持正确 | ✅ `max_abs=1.953e-03` | 兜底路径正常 |
 
-**结果分叉两条 v2 路线**：
+**结论：进入分支 B**。CANN 8.2.RC1 没修复 sm2/sm4，O(S²) bool mask 必须保留。
+- 好消息：v1 现有显式 mask 路线在新环境零回归（M1~M5 全套 93 passed），算法层无任何变动需求
+- 坏消息：v2 仍要靠分块 attention / 序列并行解决 128K OOM，工程量未减
 
-- **分支 A：sparse_mode=2/4 修了** → O(S²) bool mask 一行代码解决，128K 立刻能跑（甜区从 32K 推到 ≥128K）。后续 v2 重心收敛到唯一一件事：**消除 per-head Python 循环**（host-bound）。
-- **分支 B：没修** → 升级仍有 Triton-Ascend 解锁价值，但 O(S²) mask 必须靠分块 attention / 序列并行解决，v2 工程量翻倍。
-
-**无论结果如何**：更新 memory `project-minference-npu-fa-sparse-mode-quirk` 那张行为表 + 同步本文件 §9.1 / §9.3。
+**附带信息**：sm4 输出与 full attention 的 `max_abs=2.441e-04` 是新发现的确诊证据 —— 证明 `pre_tockens / next_tockens` 在 8.2.RC1 下被无视而非"按其他方式生效"，未来排查同类问题可作旁证。已同步 §9.1 / §9.3 行为表 + memory `project-minference-npu-fa-sparse-mode-quirk`。
 
 ### 11.3 v2 待解决问题清单（按优先级，详见两个 memory）
 
 | 优先级 | 问题 | 解决路径（按推荐序） |
 |---|---|---|
 | **P0** | per-head Python 循环 host-bound（minference 比 dense 慢 ~135×） | (1) batched 32-head 调度 (2) Triton-Ascend kernel (3) `torch_npu.npu.graph_mode` |
-| **P0** | O(S²) bool mask 显存（128K OOM） | (1) **`sparse_mode=2/4` 复测修复**（首选，零开发）(2) dense 分块 (3) Triton-Ascend 分块 (4) SP |
+| **P0** | O(S²) bool mask 显存（128K OOM） | ~~(1) sparse_mode=2/4 复测修复~~ **已证伪（§11.2，8.2.RC1 未修）** → (1) dense 分块 (2) Triton-Ascend 分块 (3) SP |
 | P1 | 128K+ 多卡 attention（device_map=auto 仅切 layer） | TP / 序列并行 SP |
 | P2 | minference 真稀疏路径 S>16384 silent fallback dense | 优化 topk/sort/`convert_vertical_slash_indexes` |
 
 ### 11.4 v2 启动前置 checklist（用户回来对一遍）
 
-- [ ] 旧 env (`minference-npu`) 备份完毕（`~/minference-npu-cann81.yml`）
-- [ ] CANN 8.2.RC1 装好，`ASCEND_HOME_PATH` 指向新版本
-- [ ] 新 env `minference-npu-cann82` 建好，`pip install -r requirements.txt` 无报错
-- [ ] `tests/test_env.py` PASS（fp16 max_abs_diff < 1e-2）
-- [ ] `pytest tests/` 全套 PASS（M1~M5 单测在新环境无回归）
-- [ ] **`sparse_mode=2/4` 复测完成，结果回填本文件 §9.1 / §9.3 + memory**
+- [x] CANN 8.2.RC1 装好，`ASCEND_HOME_PATH` 指向新版本
+- [x] 新 env `flexhead` 建好（注：实际命名而非计划的 `minference-npu-cann82`），`pip install -r requirements.txt` 无报错
+- [x] `tests/test_env.py` PASS（实测 max_abs_diff=1.953e-03）
+- [x] `pytest tests/` 全套 PASS（93 passed，M1~M5 在新环境零回归）
+- [x] **`sparse_mode=2/4` 复测完成 — 分支 B 确认**，结果已回填 §9.1 / §9.3 / §11.2
 
-完成上述六项后，按 §11.3 的 P0 进入 v2 实质开发。第一次对话开口用一句话就够：「CANN 升完了，sparse_mode 复测结果是 X，开始 v2」。
+**所有前置项已 done（2026-05-25）**。v2 实质开发按 §11.3 推进，但 O(S²) mask 行的"零开发选项"已划掉 —— 见 §11.2。
 
 **关联 memory**：`project-minference-v1-perf-host-bound`、`project-minference-v1-mask-o-s2-ceiling`、`project-minference-npu-fa-sparse-mode-quirk`、`project-minference-v1-decisions`、`project-minference-ascend-migration`。
