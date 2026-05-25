@@ -139,10 +139,7 @@ python tests/test_env.py --with-triton -v
 | `sparse_mode=2 + pre_tockens/next_tockens` | ~3.6 | full attention |
 | **`sparse_mode=1 + 显式 [S_q, S_k] bool atten_mask`** | **~0.00195（mean~2e-5）** | **正确 causal** |
 
-结论：路径 A 的所有 dense / 稀疏 causal 调用都走 `sparse_mode=1 + 显式 atten_mask`。
-- bool mask 约定：`True = masked out`（与 M3/M4 的 `_block_sparse_npu` / `_vertical_slash_npu` 保持一致）。
-- 个别 torch_npu 小版本只接受 `uint8` mask，已经在调用点用 `try/except TypeError` 兜底转换。
-- 该结论待 CANN 升级到 8.2+/torch_npu 2.6 线时复测；若届时 `sparse_mode=2` 行为修正，可回滚到无 mask 写法以省 `[S_q, S_k]` 显存。
+结论：路径 A 的所有 dense / 稀疏 causal 调用都走 `sparse_mode=1 + 显式 atten_mask`（`True=masked`，与 M3/M4 既有约定一致），`try/except TypeError` 兜底 `uint8`。修正后实机 smoke max_abs_diff=1.953e-03，PASS。CANN 升到 8.2+ 时可复测 `sparse_mode=2`，决定是否回滚省 `[S_q, S_k]` mask 显存。
 
 ---
 
