@@ -33,6 +33,12 @@ def main() -> int:
         help="HF 模型名（要在 MODEL2PATH 里有对应的 best_pattern JSON）",
     )
     parser.add_argument(
+        "--model-path",
+        default=None,
+        help="可选：本地权重目录。给定时 from_pretrained 走该路径，"
+             "best_pattern 仍按 --model 在 MODEL2PATH 里查。",
+    )
+    parser.add_argument(
         "--ctx-len",
         type=int,
         default=8192,
@@ -69,10 +75,12 @@ def main() -> int:
 
     from minference import MInference
 
-    print(f"[1/4] 加载 tokenizer & model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    load_src = args.model_path or args.model
+    print(f"[1/4] 加载 tokenizer & model: {load_src}"
+          + (f"  (best_pattern key={args.model})" if args.model_path else ""))
+    tokenizer = AutoTokenizer.from_pretrained(load_src, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+        load_src,
         torch_dtype=torch.float16,
         device_map=args.device_map,
         trust_remote_code=True,
