@@ -2,7 +2,7 @@
 
 将微软 [MInference 1.0](https://github.com/microsoft/MInference) 的长上下文稀疏注意力推理加速方案，迁移到华为昇腾 NPU（Ascend 910B 系列）。
 
-> **状态**：v1 早期阶段（M0/M1 链路打通中），尚未达到稀疏加速可用。详见 [`docs/migration_plan_v1.md`](docs/migration_plan_v1.md)。
+> **状态**：v1 代码侧 M0–M4 全部完成（dense 链路 + 三种稀疏 kernel 全部接入），两轮代码审查与 bug 修复已清完；下一步 M5 端到端实机联调与精度/性能报告。详见 [`docs/migration_plan_v1.md`](docs/migration_plan_v1.md) 与 [`docs/context_checkpoint.md`](docs/context_checkpoint.md)。
 
 ---
 
@@ -42,11 +42,12 @@
 
 | 阶段 | 目标 | 状态 |
 |---|---|---|
-| M0 | 环境与依赖（CANN 8.3.RC1 + torch_npu 2.6.0.RC1 + triton-ascend），`tests/test_env.py` PASS | 文档就绪，待实机验证 |
-| M1 | 上层 Python 链路打通，三种稀疏分支全部退化为 dense fallback 跑通 HF 推理 | 代码框架就绪 |
-| M2 | `stream_llm` 真稀疏 kernel（triton-ascend） | 未开始 |
-| M3 | `block_sparse` 真稀疏 kernel | 未开始 |
-| M4 | `vertical_and_slash` 真稀疏 kernel + 索引展开 | 未开始 |
+| M0 | 环境与依赖（CANN 8.3.RC1 + torch_npu 2.6.0.RC1 + triton-ascend），`tests/test_env.py` PASS | 代码与文档就绪，待实机验证 |
+| M1 | 上层 Python 链路打通，三种稀疏分支全部退化为 dense fallback 跑通 HF 推理 | 完成 |
+| M2 | `stream_llm` 真稀疏 kernel（两段 `npu_fusion_attention` + LSE 合并） | 完成 |
+| M3 | `block_sparse` 真稀疏 kernel（mean-pool + block top-k + token mask） | 完成 |
+| M4 | `vertical_and_slash` 真稀疏 kernel + 索引展开（CPU Python 双指针 + cumsum mask） | 完成 |
+| M5 | 端到端实机联调：精度对照 / 性能基准 / 长上下文效果 | 未开始（待 NPU 机器） |
 
 ---
 
