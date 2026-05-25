@@ -179,6 +179,23 @@ def _take_first_lane(stat: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _unpack_fa_result(result, *, where: str):
+    """校验 `npu_fusion_attention` 返回 (output, softmax_max, softmax_sum, ...)。
+
+    streaming 的两段 LSE 合并强依赖 softmax_max/softmax_sum；不同 torch_npu 小版本
+    返回格式可能是裸 Tensor 或更短的 tuple。这里在入口处 fail-fast，给出可定位的错误。
+    """
+    if not isinstance(result, (tuple, list)) or len(result) < 3:
+        kind = type(result).__name__
+        size = len(result) if hasattr(result, "__len__") else "n/a"
+        raise RuntimeError(
+            f"npu_fusion_attention at {where} 返回 {kind} (len={size})；"
+            " streaming kernel 需要 (output, softmax_max, softmax_sum, ...)"
+            " 才能做跨段 LSE 合并。请确认 torch_npu 版本，或切到 dense 路径绕过 streaming。"
+        )
+    return result[0], _take_first_lane(result[1]), _take_first_lane(result[2])
+
+
 def _streaming_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -217,9 +234,7 @@ def _streaming_npu(
         next_tockens=0,
     )
     # 文档定义返回元组：(attention_out, softmax_max, softmax_sum, softmax_out, seed, offset, numel)
-    o1 = pass1[0]
-    m1 = _take_first_lane(pass1[1])
-    l1 = _take_first_lane(pass1[2])
+    o1, m1, l1 = _unpack_fa_result(pass1, where="streaming pass1 (sliding window)")
 
     if n_init <= 0:
         # 没有 sink，单段直接返回（仍要 cast 回输入 dtype；npu_fusion_attention 输出已对齐）
@@ -261,9 +276,7 @@ def _streaming_npu(
             sparse_mode=1,
             atten_mask=attn_mask.to(torch.uint8),
         )
-    o2 = pass2[0]
-    m2 = _take_first_lane(pass2[1])
-    l2 = _take_first_lane(pass2[2])
+    o2, m2, l2 = _unpack_fa_result(pass2, where="streaming pass2 (sink)")
     # 全行被 mask 时 torch_npu 可能返回 NaN；nan_to_num 使 LSE 合并退化为 o1
     l2 = torch.nan_to_num(l2, nan=0.0)
 

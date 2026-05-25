@@ -90,7 +90,8 @@ class MInference:
                 with open(self.config.config_path, "r") as f:
                     self.config.attn_kwargs.setdefault("best_pattern", json.load(f))
 
-        # attn_type == "dense" 与 "minference" 共用 minference_patch；区别仅在于：
-        # - "minference" 会按 best_pattern 走 per-head 调度（M1 阶段全部 dense fallback）
-        # - "dense" 没有 best_pattern，所有 head 走 dense（结果等价，但少一遍 JSON 加载）
+        # attn_type == "dense" 与 "minference" 共用 minference_patch；区别在 forward 内部：
+        # - "minference" 按 best_pattern 走 per-head 调度（M2/M3/M4 真稀疏 kernel）
+        # - "dense" 跳过 per-head 调度与索引构造，直接 backend_npu.dense_attention，
+        #   用作精度基线；attn_type 通过 model.config.minference_attn_type 注入。
         return minference_patch(model, self.config)

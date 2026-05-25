@@ -306,6 +306,15 @@ def vertical_slash_sparse_attention(
     B, H, S_q, orig_head_d = query.shape
     S_k = key.shape[2]
 
+    # v1 仅支持 full prefill (S_q == S_k)。decode 路径 (S_q == 1) 已在外层 forward
+    # 的 q_len==1 短路里走 decode_dense，不会落到这里。chunked prefill 在 v1 不支持：
+    # _vertical_and_slash_kernel 中 s_idx = (q_len-1) - s_raw_idx 与 _build_vs_mask
+    # 的 q_rows 都假设绝对 query 位置从 0 起，S_q != S_k 时会算错索引/因果。
+    assert S_q == S_k, (
+        f"vertical_slash_sparse_attention: v1 仅支持 full prefill (S_q == S_k)；"
+        f" 得到 S_q={S_q}, S_k={S_k}。chunked prefill / prefill-with-cache 是 v1 排除项。"
+    )
+
     # head_dim pad
     head_d = orig_head_d
     if head_d not in _ALLOWED_HEAD_DIMS:

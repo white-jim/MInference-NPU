@@ -138,6 +138,9 @@ def init_minference_parameters(self) -> None:
     self.is_search = config.get("is_search", False)
     self.ne_inf = None
     self.config_path = config.get("config_path", "")
+    # attn_type 由 patch.py 注入到 model.config.minference_attn_type；缺省按 minference 处理
+    # （兼容直接构造 MInferenceConfig 但忘了 patch 的边角调用）。
+    self._minference_attn_type = config.get("minference_attn_type", "minference")
 
     if self.config_path and os.path.exists(self.config_path):
         with open(self.config_path) as f:
@@ -155,7 +158,12 @@ def init_minference_parameters(self) -> None:
 
     if "apply_rotary_pos_emb" not in self.__dict__:
         global apply_rotary_pos_emb
-        model_path = self.rotary_emb.__class__.__module__
+        # 新版 transformers 把 rotary_emb 迁到 model level，attention module 已无该属性。
+        # 此时回退到 attention 自身的 module path 找 apply_rotary_pos_emb（同包内可见）。
+        if hasattr(self, "rotary_emb"):
+            model_path = self.rotary_emb.__class__.__module__
+        else:
+            model_path = self.__class__.__module__
         apply_rotary_pos_emb = getattr(
             import_module(model_path), "apply_rotary_pos_emb"
         )
@@ -327,19 +335,30 @@ def minference_forward():
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-        set_rope_type(self)
-        cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
-        if ROPE_TYPE == "max_seq_len":
-            if cos.device != query_states.device:
-                cos = cos.to(query_states.device)
-            query_states = apply_rotary_pos_emb(query_states, cos)
-            key_states = apply_rotary_pos_emb(key_states, cos)
-        else:
+        # 新版 transformers 把 (cos, sin) 直接通过 position_embeddings 传给 attention
+        # forward；旧版仍走 self.rotary_emb。两种路径都要支持。
+        position_embeddings = kwargs.get("position_embeddings", None)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
             if position_ids is not None and position_ids.device != cos.device:
                 position_ids = position_ids.to(cos.device)
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, position_ids
             )
+        else:
+            set_rope_type(self)
+            cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
+            if ROPE_TYPE == "max_seq_len":
+                if cos.device != query_states.device:
+                    cos = cos.to(query_states.device)
+                query_states = apply_rotary_pos_emb(query_states, cos)
+                key_states = apply_rotary_pos_emb(key_states, cos)
+            else:
+                if position_ids is not None and position_ids.device != cos.device:
+                    position_ids = position_ids.to(cos.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
@@ -364,22 +383,30 @@ def minference_forward():
             )
 
         if q_len != 1:
-            # prefill：起始层走 dense，之后按 best_pattern 分头
-            output = torch.empty_like(query_states)
-            for head in range(query_states.size(1)):
-                q = query_states[:, head, :, :].unsqueeze(1)
-                k = key_states[:, head, :, :].unsqueeze(1)
-                v = value_states[:, head, :, :].unsqueeze(1)
+            # attn_type == "dense"：所有 head/layer 走 backend_npu.dense_attention，
+            # 不进 per-head 调度，也不构造任何稀疏索引。dense 模式即裸 npu_fusion_attention
+            # 基线，用于精度对照。
+            if self._minference_attn_type == "dense":
+                output = dense_attention(
+                    query_states, key_states, value_states, causal=True
+                )
+            else:
+                # prefill：起始层走 dense，之后按 best_pattern 分头
+                output = torch.empty_like(query_states)
+                for head in range(query_states.size(1)):
+                    q = query_states[:, head, :, :].unsqueeze(1)
+                    k = key_states[:, head, :, :].unsqueeze(1)
+                    v = value_states[:, head, :, :].unsqueeze(1)
 
-                if self.layer_idx >= self.starting_layer and not self.is_search:
-                    attn_output = gather_last_q_vertical_slash_topk_v4(
-                        self, q, k, v, head
-                    )
-                else:
-                    # 起始层 / search 模式 → dense
-                    attn_output = dense_attention(q, k, v, causal=True)
+                    if self.layer_idx >= self.starting_layer and not self.is_search:
+                        attn_output = gather_last_q_vertical_slash_topk_v4(
+                            self, q, k, v, head
+                        )
+                    else:
+                        # 起始层 / search 模式 → dense
+                        attn_output = dense_attention(q, k, v, causal=True)
 
-                output[:, head : head + 1] = attn_output
+                    output[:, head : head + 1] = attn_output
         else:
             # decode 路径：一次性整 head 调用，不走 per-head 循环（与上游 line 584 一致）
             output = decode_dense(query_states, key_states, value_states)

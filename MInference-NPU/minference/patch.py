@@ -70,10 +70,13 @@ def minference_patch(model: torch.nn.Module, config: Any) -> torch.nn.Module:
     AttentionClass = attention_module.__class__
     forward_closure = minference_forward()
 
-    # 把 starting_layer / config_path 注入到 model.config，以便每层 attention 的
-    # init_minference_parameters() 能读到（与上游 models_patch_upstream.py:96 同步）
+    # 把 starting_layer / config_path / attn_type 注入到 model.config，以便每层 attention 的
+    # init_minference_parameters() 能读到（与上游 models_patch_upstream.py:96 同步）。
+    # attn_type 用于在 forward 中区分 dense（裸 npu_fusion_attention，绕开 per-head 调度）
+    # 与 minference（按 best_pattern 走 per-head 调度）。
     model.config.starting_layer = config.starting_layer
     model.config.config_path = config.config_path
+    model.config.minference_attn_type = config.attn_type
 
     def update_module(m: torch.nn.Module) -> None:
         if isinstance(m, AttentionClass):
