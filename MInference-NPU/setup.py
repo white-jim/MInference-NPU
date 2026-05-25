@@ -2,7 +2,8 @@
 # Licensed under The MIT License [see LICENSE for details]
 #
 # MInference-NPU 安装脚本（v1）
-# - 不构建 CUDA 扩展（v1 NPU 端用 Triton-Ascend 重写索引展开 kernel）
+# - 不构建 CUDA 扩展：上游 `csrc/vertical_slash_index.cu` 由 `backend_npu/cuda_shim.py`
+#   的纯 Python/CPU 双指针实现顶替；三种稀疏 kernel 走 `npu_fusion_attention` + bool mask。
 # - 与上游 MInference 的 setup.py 区别：去掉 CUDAExtension/cmdclass
 
 from setuptools import find_packages, setup

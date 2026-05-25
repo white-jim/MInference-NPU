@@ -8,7 +8,7 @@
 
 ## 1. 任务一句话
 
-把 Microsoft [MInference 1.0](https://github.com/microsoft/MInference) 长上下文 LLM 推理加速算法迁移到 **华为昇腾 NPU**，v1 走 **Triton-Ascend + npu_fusion_attention** 路径，宿主 **HF transformers + torch_npu**。
+把 Microsoft [MInference 1.0](https://github.com/microsoft/MInference) 长上下文 LLM 推理加速算法迁移到 **华为昇腾 NPU**，v1 走 **`npu_fusion_attention` + bool mask（路径 A）** 一条路（Triton-Ascend 留 v2，原因见 `MInference-NPU/docs/SETUP.md` §2：CANN 8.1.RC1 与 triton-ascend 版本矩阵不匹配），宿主 **HF transformers + torch_npu**。
 
 - 上游源码（参考蓝本，**不动**）：`MInference/`
 - v1 产出主线：`MInference-NPU/`
@@ -22,7 +22,7 @@
 |---|---|
 | 迁移范围 | vertical_and_slash + block_sparse + stream_llm + dense fallback |
 | 排除项 | dilated / static / tri_shape / kvcompress / dist_ops / vLLM 集成 / FA3 / KV-CPU offload |
-| 算子主路径 | Triton-Ascend + `npu_fusion_attention`（路径 A：bool mask） |
+| 算子主路径 | `npu_fusion_attention` + bool mask（路径 A）；Triton-Ascend 留 v2（CANN 8.1.RC1 下版本矩阵不匹配） |
 | `convert_vertical_slash_indexes` | CPU Python 双指针（M4-a）；NPU kernel 留 v2 |
 | 框架宿主 | HF transformers + torch_npu；accelerate `device_map="auto"` 多卡 OK |
 | 产出形态 | 独立 `MInference-NPU/` 完整 py 源 + tests + examples + docs + 独立 setup.py |
@@ -104,7 +104,7 @@ M5 不引入新代码，只做实机验证：
 - **目标 NPU 服务器**（实机）：aarch64 / openEuler 22.03 LTS-SP4 / 910B3 / 驱动 25.0.rc1.1 / CANN Toolkit 8.1.RC1（`ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/8.1.RC1`）/ Python 3.10 / torch 2.5.1 + torch_npu 2.5.1 / transformers 4.57.3 / accelerate 0.34.2。Triton-Ascend 在 CANN 8.1.RC1 下不作为默认依赖。完整矩阵见 `MInference-NPU/docs/SETUP.md`。
 - **device-agnostic 守则**（M1 落地、M2-M4 守住）：
   1. 禁止写死 `npu:0` 或 `device="cuda"`，所有 tensor 跟随输入 device。
-  2. Triton-Ascend kernel launch 也跟随输入 device。
+  2. 若 v2 引入 Triton-Ascend kernel，launch 同样需要跟随输入 device（v1 暂未启用，路径 A 全程走 `npu_fusion_attention`）。
   3. accelerate `device_map="auto"` 多卡靠这条覆盖；vLLM TP / 序列并行 / EP 留 v2。
 - **长上下文多卡**：手动给 `max_memory` 留 KV 余量（配置层面，不改代码）。
 

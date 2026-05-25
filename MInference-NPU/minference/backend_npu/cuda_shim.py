@@ -21,8 +21,9 @@ M4-a 设计决策：
   3. 相邻区间合并为连续 range；垂直列去重（落在 range 内不重复）。
   4. 输出 block_count/block_offset（slash 段）和 column_count/column_index（vertical 列）。
 
-输出用途：喂给 M4-b 的 vertical-slash attention kernel（构建 token 级 attention mask 或
-Triton-Ascend 稀疏 kernel 的索引结构）。
+输出用途：喂给 M4-b 的 vertical-slash attention kernel，由后者构建 token 级 bool
+attention mask 后调 `npu_fusion_attention(sparse_mode=1)`（路径 A，v1 已落地）。同一组
+索引结构在 v2 也可直接复用为 Triton-Ascend 稀疏 kernel 的输入，无需重新设计。
 """
 
 from __future__ import annotations
@@ -154,8 +155,10 @@ def convert_vertical_slash_indexes(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """CPU Python 实现的 CUDA 双指针索引展开。
 
-    将 vertical/slash 稀疏索引转换为适合 Triton-Ascend / npu_fusion_attention
-    消费的 (block_count, block_offset, column_count, column_index) 四元组。
+    将 vertical/slash 稀疏索引转换为 (block_count, block_offset, column_count,
+    column_index) 四元组：v1 由 `ops/vertical_slash_kernel_npu.py` 据此构建 token
+    级 bool mask 喂给 `npu_fusion_attention`；v2 若引入 Triton-Ascend 稀疏 kernel
+    可直接复用同一组索引。
 
     Args:
         seqlens:          实际序列长度，shape [BATCH]，int32。

@@ -4,6 +4,14 @@
 > 创建日期：2026-05-23
 > 关联文档：`docs/MInference_1.0_implementation.md`、`docs/ascend_migration_survey.md`、`docs/context_checkpoint.md`
 
+> **⚠️ 实施路径变更说明（2026-05-25 回填）**
+>
+> 本文是 v1 立项时的原始计划，原方案以 **Triton-Ascend** 作为算子主路径（见 §0、§4、§6-M0、§6-M3、§6-M4-a 等处）。M0 进入实机环境后发现：实机为 CANN 8.1.RC1 + torch_npu 2.5.1，而 triton-ascend 要求 CANN 8.2+/torch_npu 2.6 线（见 `MInference-NPU/docs/SETUP.md` §2），版本矩阵不匹配。
+>
+> **实际落地的方案**：M2/M3/M4 三个稀疏 kernel 全部走「**路径 A**」——`npu_fusion_attention` 的 `sparse_mode` + 显式 `atten_mask` 组合表达稀疏，不引入任何 Triton-Ascend 代码；`convert_vertical_slash_indexes` 在 CPU 用 Python 双指针实现。Triton-Ascend 降级为 v2 性能优化的备选（路径 B），见 `context_checkpoint.md` §8 的 P5/P6。
+>
+> 阅读本文时，凡涉及 "Triton-Ascend 重写 / Triton-Ascend kernel" 的段落，请理解为**未实施的原计划**；实际实现以各 milestone 文档（`docs/M2_streaming.md` / `docs/M3_block_sparse.md` / `docs/M4_vertical_slash.md`）和 `context_checkpoint.md` §2、§5 为准。
+
 ---
 
 ## 0. 决策摘要（v1 已拍板）
