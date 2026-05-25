@@ -1,0 +1,27 @@
+# Runtime and test dependencies for MInference-NPU.
+# Python 3.10 is the target environment for the Ascend NPU deployment.
+
+# Ascend NPU stack.
+torch==2.6.0
+torch-npu==2.6.0rc1
+triton-ascend==3.2.0
+
+# Core runtime.
+accelerate==0.34.2
+numpy==1.26.4
+transformers==4.57.3
+
+# Hugging Face model/tokenizer support.
+huggingface-hub==0.36.0
+safetensors==0.6.2
+sentencepiece==0.2.1
+tokenizers==0.22.1
+tqdm==4.67.1
+
+# torch-npu / runtime support.
+packaging==25.0
+PyYAML==6.0.3
+
+# Tests.
+pytest==9.0.2
+pytest-xdist==3.6.1
