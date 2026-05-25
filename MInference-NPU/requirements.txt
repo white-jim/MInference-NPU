@@ -2,8 +2,9 @@
 # Python 3.10 is the target environment for the Ascend NPU deployment.
 
 # Ascend NPU stack.
-torch==2.5.1
-torch-npu==2.5.1
+# 对齐 CANN 8.2.RC1（v2 起）；driver 25.0.rc1.1 保持不变。
+torch==2.6.0
+torch-npu==2.6.0
 
 # Core runtime.
 accelerate==0.34.2

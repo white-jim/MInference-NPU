@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` + `test_streaming_kernel`（32/32，含 3 NPU）+ `test_block_sparse_kernel`（29/29，含 3 NPU）+ `test_vertical_slash_kernel`（27/27，含 1 NPU）实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）；streaming kernel 段 1 `sparse_mode=4`→`sparse_mode=1+显式 mask`（§9.3）。剩 HF 端到端 `examples/run_hf_minimal.py`。
+> 最近更新：2026-05-25 — **v1 收尾完毕，v2 启动**。已锁定 CANN 8.2.RC1 + torch/torch_npu 2.6.0 升级方案，`MInference-NPU/requirements.txt` 已改，等用户实机升 CANN + 建新 env 后回来。**回来第一件事是复测 `sparse_mode=2/4` 行为表**（见 §11）。
 > 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -40,8 +40,8 @@
 [x] M4 Vertical-Slash kernel（M4-a CPU 双指针 + M4-b NPU mask） 详见 docs/M4_vertical_slash.md
 [x] Bug 修复 首轮（B1-B5/P3/P4，2026-05-24）
 [x] Bug 修复 第二轮（B6-B9，2026-05-25）
-[~] M5 端到端联调 + 精度/性能/效果报告（test_env + test_dense_forward + test_streaming_kernel + test_block_sparse_kernel + test_vertical_slash_kernel PASS；HF 端到端 examples/run_hf_minimal.py 待跑）
-[ ] docs/migration_v1_notes.md + docs/migration_v1_report.md
+[x] M5 端到端联调 + 精度/性能/效果报告（全部 kernel test + HF 端到端 8K/16K/32K 三方对比 + 128K 多卡 ALL DONE）
+[x] docs/migration_v1_notes.md + docs/migration_v1_report.md（2026-05-25）
 ```
 
 > 代码改造与实机校验解耦：Windows 工作机上写代码、syntax 检查通过即可推进；NPU 实机跑 `tests/test_*.py` 是用户拿到机器后并行做。
@@ -172,3 +172,113 @@ M5 不引入新代码，只做实机验证：
 **显存代价**：mask `[1,1,S_q,S_k]` 在 S=16384 内单测无压力；S>16384 已由 P7 silent dense fallback 兜底，本次不动。CANN 升 8.2+ 时可复测 `sparse_mode=4`，命中后回滚省 mask。
 
 **仍需盯**：M3 block-sparse / M4 vertical-slash 的 NPU 段已经全程显式 mask，理论上不踩此坑；M5 跑 `tests/test_block_sparse_kernel.py` + `tests/test_vertical_slash_kernel.py` 时确认。
+
+### 9.4 【v1 最大设计代价】minference per-head Python 循环 host-bound（2026-05-25）
+
+**触发**：M5 第二轮 HF 端到端三组数据（Llama-3.1-8B fp16，单卡 npu:0）：
+
+| ctx | attn | 时间 | 输出 | NPU AICore |
+|---|---|---|---|---|
+| 8K | minference | 308.53s | 正常 | ~0% |
+| 16K | minference | 616.32s | 正常 | ~0% |
+| 16K | dense | **4.57s** | **与 minference 字节级一致** | ~80% |
+
+**根因**：`minference/modules/minference_forward.py:413-437` 对 32 个 query head 做 Python `for` 循环，每个 head 内部 ≥7 个 NPU 算子调用（QK 估计 / softmax / topk×2 / sort×2 / bool mask 构造 / `npu_fusion_attention`），prefill 一次的总算子调用数 ≈ 32 层 × 32 head × 7 ≈ **7000+ 次小 launch**。NPU 算完一个等 Python 派下一个 → device 持续空转。
+
+对照：dense 路径每层 1 次 `npu_fusion_attention(H=32, S=16384)` 大算子，AICore 打满 80%。
+
+**确认证据**：用户实机 `npu-smi info` 同时观察 dense（AICore 80%+）和 minference（持续 0%、偶尔 1%）；权重 24 GiB 在 HBM，排除 CPU 推理。
+
+**v1 内不修**（架构层代价，立项即拍板"v1 不追性能"）。**v2 第一优先级**：消除 per-head 循环，三种可选路径：
+1. batched 调度（首选）：32 head 的 v_idx/s_idx 一次性并行构造 + 单次 batched mask + 单次全 head FA
+2. Triton-Ascend kernel（待 CANN 8.2+）
+3. NPU 图模式 capture
+
+**详细记录**：`docs/migration_v1_notes.md` §8；`docs/migration_v1_report.md` §5。
+
+---
+
+## 10. v1 验收（2026-05-25 收尾）
+
+**结论**：v1 验收通过。算法 + 精度 + 链路全部交付，性能/长上下文上限作为已知设计代价精确量化。
+
+| 维度 | 状态 |
+|---|---|
+| 算法迁移完整性 | ✅ 三类稀疏 kernel + dense + HF 链路全到位 |
+| 精度 | ✅ 16K minference vs dense bit-identical |
+| 性能 | ⚠️ minference 比 dense 慢 ~135×（host-bound），生产侧目前用 `--attn-type dense` |
+| 长上下文 | ✅ 单卡 ≤32K；❌ 128K（bool mask O(S²) OOM） |
+| 多卡 | ✅ accelerate 切层；❌ TP/SP（v2） |
+
+**v2 启动前先解决两件事**（详见 `migration_v1_report.md` §9）：
+1. 消除 per-head Python 循环（解锁性能）
+2. CANN 升级到 8.2+ 复测 `sparse_mode=2/4`（可能直接省 O(S²) mask 显存）
+
+**收尾产物**：`docs/migration_v1_notes.md`（13 条踩坑）+ `docs/migration_v1_report.md`（四维验收）+ 实测原始日志 `MInference-NPU/tests/M5_test_results{,_round2}.md`。
+
+---
+
+## 11. v2 启动计划（2026-05-25 锁定，等用户升完 CANN 回来执行）
+
+### 11.1 环境升级（用户在 NPU 机执行，主对话不参与）
+
+| 维度 | 旧（v1） | 新（v2） |
+|---|---|---|
+| 驱动 / npu-smi | 25.0.rc1.1 | **不变** |
+| CANN Toolkit + Kernels | 8.1.RC1 | **8.2.RC1** |
+| torch / torch_npu | 2.5.1 / 2.5.1 | **2.6.0 / 2.6.0** |
+| Python | 3.10 | 不变 |
+| transformers / accelerate / 其余 | 4.57.3 / 0.34.2 / ... | 不变 |
+
+**为什么是 8.2.RC1（不是 8.3 也不是停在 8.1）**：是同时满足两个 v2 P0 目标（`sparse_mode=2/4` 修复 + 解锁 Triton-Ascend）的**最小升级**。8.3 跨度大、torch 要跳到 2.7/2.8、transformers 兼容性未验证；停在 8.1 等于没动。
+
+**driver 25.0.rc1.1 不升**：用户明确不接 vllm-ascend 等下游推理框架，无需配套新驱动；CANN 8.2.RC1 与 25.0.rc1.1 驱动可兼容。
+
+**已落地**：`MInference-NPU/requirements.txt` 的 torch / torch_npu 已改为 2.6.0，其余依赖未动。
+
+**升级执行顺序**（用户侧 SOP，新 conda env 名 `minference-npu-cann82`，旧 env 保留作回滚）：
+1. 备份旧 env：`conda env export > ~/minference-npu-cann81.yml`
+2. 装新 CANN（toolkit + kernels-910b），并存 8.1.RC1 不覆盖
+3. `source /usr/local/Ascend/ascend-toolkit/set_env.sh` → 校验 `ASCEND_HOME_PATH` 指向 8.2.RC1
+4. `conda create -n minference-npu-cann82 python=3.10 -y && conda activate ...`
+5. `pip install -r requirements.txt && pip install -e .`
+6. 三层校验：`torch.npu.is_available()`、`python tests/test_env.py`、`pytest tests/`（全套 M1~M5 单测）
+
+### 11.2 升完回来第一件事：复测 `sparse_mode` 行为表（**v2 P0 路径分叉点**）
+
+写一个最小测试逐项验证（B=1, N=4, S=256, D=128, fp16，对照手写 PyTorch eager causal/band）：
+
+| 调用 | 期望（修复后） | 影响 |
+|---|---|---|
+| `sparse_mode=2` 无 mask | causal，`max_abs_diff < 1e-2` | 若 ✅ → 路径 A 可省 `[S_q,S_k]` mask |
+| `sparse_mode=4 + pre_tockens, next_tockens=0` | sliding-window band | 若 ✅ → streaming kernel 段 1 可回滚省 mask |
+| `sparse_mode=1 + 显式 mask` | 保持正确 | 兜底路径，预期不变 |
+
+**结果分叉两条 v2 路线**：
+
+- **分支 A：sparse_mode=2/4 修了** → O(S²) bool mask 一行代码解决，128K 立刻能跑（甜区从 32K 推到 ≥128K）。后续 v2 重心收敛到唯一一件事：**消除 per-head Python 循环**（host-bound）。
+- **分支 B：没修** → 升级仍有 Triton-Ascend 解锁价值，但 O(S²) mask 必须靠分块 attention / 序列并行解决，v2 工程量翻倍。
+
+**无论结果如何**：更新 memory `project-minference-npu-fa-sparse-mode-quirk` 那张行为表 + 同步本文件 §9.1 / §9.3。
+
+### 11.3 v2 待解决问题清单（按优先级，详见两个 memory）
+
+| 优先级 | 问题 | 解决路径（按推荐序） |
+|---|---|---|
+| **P0** | per-head Python 循环 host-bound（minference 比 dense 慢 ~135×） | (1) batched 32-head 调度 (2) Triton-Ascend kernel (3) `torch_npu.npu.graph_mode` |
+| **P0** | O(S²) bool mask 显存（128K OOM） | (1) **`sparse_mode=2/4` 复测修复**（首选，零开发）(2) dense 分块 (3) Triton-Ascend 分块 (4) SP |
+| P1 | 128K+ 多卡 attention（device_map=auto 仅切 layer） | TP / 序列并行 SP |
+| P2 | minference 真稀疏路径 S>16384 silent fallback dense | 优化 topk/sort/`convert_vertical_slash_indexes` |
+
+### 11.4 v2 启动前置 checklist（用户回来对一遍）
+
+- [ ] 旧 env (`minference-npu`) 备份完毕（`~/minference-npu-cann81.yml`）
+- [ ] CANN 8.2.RC1 装好，`ASCEND_HOME_PATH` 指向新版本
+- [ ] 新 env `minference-npu-cann82` 建好，`pip install -r requirements.txt` 无报错
+- [ ] `tests/test_env.py` PASS（fp16 max_abs_diff < 1e-2）
+- [ ] `pytest tests/` 全套 PASS（M1~M5 单测在新环境无回归）
+- [ ] **`sparse_mode=2/4` 复测完成，结果回填本文件 §9.1 / §9.3 + memory**
+
+完成上述六项后，按 §11.3 的 P0 进入 v2 实质开发。第一次对话开口用一句话就够：「CANN 升完了，sparse_mode 复测结果是 X，开始 v2」。
+
+**关联 memory**：`project-minference-v1-perf-host-bound`、`project-minference-v1-mask-o-s2-ceiling`、`project-minference-npu-fa-sparse-mode-quirk`、`project-minference-v1-decisions`、`project-minference-ascend-migration`。
