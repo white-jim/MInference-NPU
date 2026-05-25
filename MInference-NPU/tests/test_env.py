@@ -1,11 +1,15 @@
 # Copyright (c) 2026
 # Licensed under The MIT License [see LICENSE for details]
-"""M0 环境烟测 — 两个独立子测试：
+"""M0 环境烟测。
 
-1. test_triton_ascend_vector_add
+默认只跑当前 v1 必需的 torch_npu / npu_fusion_attention 烟测。
+
+可选子测试：
+1. test_triton_ascend_vector_add（--with-triton）
    跑最小 Triton-Ascend vector add kernel，与 PyTorch CPU 参考逐元素对比，
    验证 triton-ascend 工具链 / JIT 编译 / kernel launch 链路。
 
+必跑子测试：
 2. test_npu_fusion_attention_smoke
    调 torch_npu.npu_fusion_attention 跑一个小尺寸 dense causal attention，
    与手写 PyTorch eager（softmax + causal mask）参考对比，
@@ -15,10 +19,10 @@
     python tests/test_env.py            # 标准模式，print PASS/FAIL
     python tests/test_env.py -v         # 详细输出（含 shape / 差异）
 
-退出码：全部 PASS 退出 0，任一 FAIL 退出 1。
+退出码：已启用的测试全部 PASS 退出 0，任一 FAIL 退出 1。
 
-注意：必须在 Linux + Ascend 驱动 + CANN + torch_npu + triton-ascend 的目标 NPU 机器
-上跑。在 Windows 工作机上 import torch_npu 会失败，脚本会清晰报错并 FAIL。
+注意：必须在 Linux + Ascend 驱动 + CANN + torch_npu 的目标 NPU 机器上跑。
+在 Windows 工作机上 import torch_npu 会失败，脚本会清晰报错并 FAIL。
 """
 
 import argparse
@@ -210,16 +214,20 @@ def test_npu_fusion_attention_smoke(verbose: bool = False) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="M0 NPU 环境烟测")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
+    parser.add_argument(
+        "--with-triton",
+        action="store_true",
+        help="额外验证 Triton-Ascend。CANN 8.1.RC1 默认不要求安装。",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
     print("MInference-NPU M0 环境烟测")
     print("=" * 60)
 
-    results = [
-        test_triton_ascend_vector_add(args.verbose),
-        test_npu_fusion_attention_smoke(args.verbose),
-    ]
+    results = [test_npu_fusion_attention_smoke(args.verbose)]
+    if args.with_triton:
+        results.insert(0, test_triton_ascend_vector_add(args.verbose))
 
     print("-" * 60)
     if all(results):

@@ -101,7 +101,7 @@ M5 不引入新代码，只做实机验证：
 ## 7. 环境与守则
 
 - **平台**：Windows 10 Pro / bash / Unix 风格路径；目录含中文「算法迁移」，shell 操作需引号包裹。
-- **目标 NPU 服务器**（假定，待实机确认）：Atlas 800T A2 / 8×910B3 64GB HBM / Ubuntu 22.04 aarch64 / CANN ≥ 8.3.RC1 / torch 2.6.0 + torch_npu ≥ 2.6.0.RC1 / triton-ascend / Python 3.10 / transformers ≥ 4.45 / accelerate ≥ 0.28。完整矩阵见 `MInference-NPU/docs/SETUP.md`。
+- **目标 NPU 服务器**（实机）：aarch64 / openEuler 22.03 LTS-SP4 / 910B3 / 驱动 25.0.rc1.1 / CANN Toolkit 8.1.RC1（`ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/8.1.RC1`）/ Python 3.10 / torch 2.5.1 + torch_npu 2.5.1 / transformers 4.57.3 / accelerate 0.34.2。Triton-Ascend 在 CANN 8.1.RC1 下不作为默认依赖。完整矩阵见 `MInference-NPU/docs/SETUP.md`。
 - **device-agnostic 守则**（M1 落地、M2-M4 守住）：
   1. 禁止写死 `npu:0` 或 `device="cuda"`，所有 tensor 跟随输入 device。
   2. Triton-Ascend kernel launch 也跟随输入 device。

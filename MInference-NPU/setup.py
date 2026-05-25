@@ -16,7 +16,7 @@ setup(
     description="MInference 1.0 ported to Huawei Ascend NPU (v1)",
     long_description=(
         "Ascend NPU port of Microsoft MInference 1.0 long-context prefill "
-        "acceleration. Targets CANN 8.3+ / torch_npu 2.6+ / triton-ascend. "
+        "acceleration. Targets CANN 8.1+ / torch_npu 2.5+ / npu_fusion_attention. "
         "v1 scope: vertical_and_slash + block_sparse + stream_llm + dense fallback."
     ),
     author="MInference-NPU contributors",
@@ -28,8 +28,8 @@ setup(
         "minference.configs": ["*.json", "leank/*"],
     },
     install_requires=[
-        "torch>=2.6.0",
-        # torch_npu / triton-ascend / CANN 走昇腾官方渠道，pip 上不直接拉取
+        "torch>=2.5.1,<2.7",
+        # torch_npu / CANN 走昇腾官方渠道，版本需按实机 CANN 匹配。
         "transformers>=4.45",
         "accelerate>=0.28",
         "numpy",

@@ -2,9 +2,8 @@
 # Python 3.10 is the target environment for the Ascend NPU deployment.
 
 # Ascend NPU stack.
-torch==2.6.0
-torch-npu==2.6.0rc1
-triton-ascend==3.2.0
+torch==2.5.1
+torch-npu==2.5.1
 
 # Core runtime.
 accelerate==0.34.2
