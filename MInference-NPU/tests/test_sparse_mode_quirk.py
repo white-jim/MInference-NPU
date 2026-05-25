@@ -28,6 +28,12 @@ import traceback
 
 import torch
 
+# 显式告诉 pytest 不要收集本文件：这是 standalone 脚本，跑法是
+#   python tests/test_sparse_mode_quirk.py -v
+# 不是 pytest fixture-based 测试。
+__test__ = False
+collect_ignore = ["test_sparse_mode_quirk.py"]
+
 
 def _print_status(name: str, ok: bool, msg: str = "") -> None:
     tag = "PASS" if ok else "FAIL"
@@ -90,7 +96,7 @@ def _make_qkv(dev, dtype):
 # ---------------------------------------------------------------------------
 
 
-def test_sparse_mode_2_causal_no_mask(verbose: bool) -> bool:
+def check_sparse_mode_2_causal_no_mask(verbose: bool) -> bool:
     name = "sparse_mode=2 (no mask) should be causal"
     try:
         import torch_npu
@@ -133,7 +139,7 @@ def test_sparse_mode_2_causal_no_mask(verbose: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_sparse_mode_4_sliding_window(verbose: bool) -> bool:
+def check_sparse_mode_4_sliding_window(verbose: bool) -> bool:
     name = "sparse_mode=4 (pre_tockens=W-1, next_tockens=0) should be sliding-window"
     try:
         import torch_npu
@@ -194,7 +200,7 @@ def test_sparse_mode_4_sliding_window(verbose: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_sparse_mode_1_explicit_mask(verbose: bool) -> bool:
+def check_sparse_mode_1_explicit_mask(verbose: bool) -> bool:
     name = "sparse_mode=1 + explicit causal mask (baseline)"
     try:
         import torch_npu
@@ -255,9 +261,9 @@ def main() -> int:
     print("=" * 70)
 
     results = [
-        test_sparse_mode_1_explicit_mask(args.verbose),
-        test_sparse_mode_2_causal_no_mask(args.verbose),
-        test_sparse_mode_4_sliding_window(args.verbose),
+        check_sparse_mode_1_explicit_mask(args.verbose),
+        check_sparse_mode_2_causal_no_mask(args.verbose),
+        check_sparse_mode_4_sliding_window(args.verbose),
     ]
 
     print("-" * 70)
