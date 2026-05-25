@@ -219,8 +219,13 @@ def test_accelerate_device_map_auto(verbose: bool = False) -> bool | str:
         model = MInference(attn_type="dense")(model)
 
         torch.manual_seed(0)
-        # 用 cpu 的 input_ids，accelerate 会自动 move 到第一层所在的 NPU
-        input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
+        # accelerate dispatch_model 在 NPU 上未稳定地把 CPU 输入自动搬到 embed 卡（hook
+        # 触发依赖 torch 后端的 device 识别），显式 .to(embed_device) 避开此问题；本测试
+        # 关注的是多卡切层后跨设备 forward 是否能跑通，而不是 accelerate-on-NPU 的 hook 行为。
+        embed_device = next(model.model.embed_tokens.parameters()).device
+        input_ids = torch.randint(
+            0, cfg.vocab_size, (1, 128), device=embed_device
+        )
         with torch.no_grad():
             out = model(input_ids).logits
 

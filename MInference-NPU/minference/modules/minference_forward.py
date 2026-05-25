@@ -287,22 +287,43 @@ def minference_forward():
     与上游 `minference_forward_upstream.py:497` 的差异：
     - decode 与 prefill 都用 `backend_npu.{decode_dense,dense_attention}`，不依赖 flash_attn
     - is_search 路径保留（仍然只在 GPU 上跑搜索；NPU 上 is_search=True 会 warn）
+
+    签名适配 transformers 4.57.3（LlamaDecoderLayer 用全 kwargs 调 self_attn）：
+    - 所有参数带默认值；`past_key_values` 用新版复数命名，旧版 `past_key_value` 通过 kwargs 兼容
+    - `output_attentions` 在新版已删除（保留默认以兼容旧版 kwargs 误传）
+    - `position_embeddings` 提升为命名参数；新版 RoPE 必走此路径
+    - 返回 2-tuple `(attn_output, attn_weights)`（新版 LlamaDecoderLayer 期望）
+    - `num_heads` / `num_key_value_heads` 改从 `self.config` 读取（4.57+ 不再挂在 attention module 上）
     """
 
     def forward(
         self,
         hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_value,
-        output_attentions,
-        use_cache,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        output_attentions=False,
         **kwargs,
     ):
+        # 兼容旧版 transformers：past_key_value（单数）落进 kwargs
+        if past_key_values is None:
+            past_key_values = kwargs.pop("past_key_value", None)
+
         self.init_minference_parameters()
         self.ne_inf = torch.finfo(hidden_states.dtype).min
 
         bsz, q_len, _ = hidden_states.size()
+
+        # 新版 transformers (>=4.45) 不再把 num_heads / num_key_value_heads 挂在 attention
+        # module 上，统一从 config 取；同时兼容旧版（实例属性优先）
+        num_heads = getattr(self, "num_heads", None) or self.config.num_attention_heads
+        num_kv_heads = (
+            getattr(self, "num_key_value_heads", None)
+            or self.config.num_key_value_heads
+        )
 
         # QKV proj —— 兼容 q_proj/k_proj/v_proj 拆分式 和 qkv_proj 融合式
         if "q_proj" in self.__dict__["_modules"]:
@@ -311,33 +332,40 @@ def minference_forward():
             value_states = self.v_proj(hidden_states)
         else:
             qkv = self.qkv_proj(hidden_states)
-            query_pos = self.num_heads * self.head_dim
+            query_pos = num_heads * self.head_dim
             kv_pos = query_pos // self.num_key_value_groups
             query_states, key_states, value_states = torch.split(
                 qkv, [query_pos, kv_pos, kv_pos], -1
             )
 
         query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
+            bsz, q_len, num_heads, self.head_dim
         ).transpose(1, 2)
         key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+            bsz, q_len, num_kv_heads, self.head_dim
         ).transpose(1, 2)
         value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+            bsz, q_len, num_kv_heads, self.head_dim
         ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
+        if past_key_values is not None:
             if self.layer_idx is None:
                 raise ValueError(
                     "Cache structure requires layer_idx since transformers v4.36."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # 新版 Cache 仅保证 get_seq_length；旧版还有 get_usable_length
+            if hasattr(past_key_values, "get_usable_length"):
+                kv_seq_len += past_key_values.get_usable_length(
+                    kv_seq_len, self.layer_idx
+                )
+            elif hasattr(past_key_values, "get_seq_length"):
+                kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
 
         # 新版 transformers 把 (cos, sin) 直接通过 position_embeddings 传给 attention
         # forward；旧版仍走 self.rotary_emb。两种路径都要支持。
-        position_embeddings = kwargs.get("position_embeddings", None)
+        if position_embeddings is None:
+            position_embeddings = kwargs.get("position_embeddings", None)
         if position_embeddings is not None:
             cos, sin = position_embeddings
             if position_ids is not None and position_ids.device != cos.device:
@@ -360,9 +388,9 @@ def minference_forward():
                     query_states, key_states, cos, sin, position_ids
                 )
 
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = past_key_value.update(
+        if past_key_values is not None and hasattr(past_key_values, "update"):
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
@@ -412,9 +440,11 @@ def minference_forward():
             output = decode_dense(query_states, key_states, value_states)
 
         attn_output = output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(bsz, q_len, num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        # 新版 LlamaDecoderLayer 期望 (attn_output, attn_weights) 二元组；
+        # 旧版 (attn_output, attn_weights, past_key_value) 在新版 transformers 下不再使用。
+        return attn_output, None
 
     return forward
