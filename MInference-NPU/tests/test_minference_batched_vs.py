@@ -26,6 +26,11 @@ import pytest
 import torch
 
 from minference.modules.minference_forward import _vertical_and_slash_kernel
+from minference.backend_npu.cuda_shim import convert_vertical_slash_indexes
+from minference.ops.vertical_slash_kernel_npu import (
+    _build_vs_mask_from_indexes_loop,
+    _build_vs_mask_from_indexes_vec,
+)
 
 try:
     import torch_npu  # type: ignore[import-not-found]
@@ -166,6 +171,70 @@ def test_scalar_vs_list_input_equivalence(device: torch.device):
 
 
 # --------------------------------------------------------------------------
+# T4: _build_vs_mask_from_indexes loop vs vec — bit-identical（PR-2）
+# --------------------------------------------------------------------------
+
+
+def _gen_vs_idx(B: int, H: int, S: int, n_v: int, n_s: int, seed: int = 0xBADBEEF):
+    """生成 (v_idx, s_idx)，与上游约定一致：v_idx 升序、s_idx 降序。"""
+    g = torch.Generator().manual_seed(seed)
+    v_lists, s_lists = [], []
+    for _ in range(B):
+        v_h, s_h = [], []
+        for _ in range(H):
+            sink = list(range(30))
+            rest = torch.randperm(max(S - 30, 1), generator=g)[: max(n_v - 30, 0)].tolist()
+            v_vals = sorted(set(sink + rest))[:n_v]
+            while len(v_vals) < n_v:
+                v_vals.append(v_vals[-1] + 1)
+            v_h.append(v_vals)
+
+            local_s = list(range(min(100, S)))
+            far_s = sorted(
+                set(torch.randint(100, max(S, 101), (max(n_s - len(local_s), 0),), generator=g).tolist()),
+                reverse=True,
+            )
+            s_vals = sorted(set(far_s + local_s), reverse=True)[:n_s]
+            while len(s_vals) < n_s:
+                s_vals.insert(0, s_vals[0] + 1)
+            s_h.append(s_vals)
+        v_lists.append(v_h)
+        s_lists.append(s_h)
+    v_idx = torch.tensor(v_lists, dtype=torch.int32)  # [B, H, n_v]
+    s_idx = torch.tensor(s_lists, dtype=torch.int32)  # [B, H, n_s]
+    return v_idx, s_idx
+
+
+@pytest.mark.parametrize(
+    "B,H,S,n_v,n_s",
+    [
+        (1, 1, 256, 50, 80),
+        (1, 4, 512, 100, 150),
+        (2, 8, 384, 60, 120),
+    ],
+)
+def test_build_mask_loop_vs_vec_bit_identical(B, H, S, n_v, n_s):
+    """`_build_vs_mask_from_indexes_loop` == `_build_vs_mask_from_indexes_vec`（CPU）。"""
+    v_idx, s_idx = _gen_vs_idx(B, H, S, n_v, n_s)
+    seqlens = torch.tensor([S] * B, dtype=torch.int32)
+    bc, bo, cc, ci = convert_vertical_slash_indexes(seqlens, v_idx, s_idx, S, 64, 64)
+
+    device = torch.device("cpu")
+    mask_loop = _build_vs_mask_from_indexes_loop(bc, bo, cc, ci, S, S, device=device)
+    mask_vec = _build_vs_mask_from_indexes_vec(bc, bo, cc, ci, S, S, device=device)
+
+    assert mask_loop.shape == mask_vec.shape
+    if not torch.equal(mask_loop, mask_vec):
+        diff = mask_loop ^ mask_vec
+        b, h, i, j = torch.nonzero(diff, as_tuple=True)
+        sample = list(zip(b[:5].tolist(), h[:5].tolist(), i[:5].tolist(), j[:5].tolist()))
+        raise AssertionError(
+            f"loop vs vec NOT bit-identical: {diff.sum().item()} 个位置不同。"
+            f"前 5 个差异坐标 (b,h,i,j) = {sample}"
+        )
+
+
+# --------------------------------------------------------------------------
 # 直接脚本运行：脱离 pytest（NPU 服务器上 `python tests/test_minference_batched_vs.py`）
 # --------------------------------------------------------------------------
 
@@ -190,5 +259,19 @@ if __name__ == "__main__":
             except Exception as e:
                 failures += 1
                 print(f"  [ERROR] {name} ({dev}): {type(e).__name__}: {e}")
+
+    # T4: loop vs vec — 只 CPU
+    for params in [(1, 1, 256, 50, 80), (1, 4, 512, 100, 150), (2, 8, 384, 60, 120)]:
+        name = f"T4 loop-vs-vec B={params[0]} H={params[1]} S={params[2]}"
+        try:
+            test_build_mask_loop_vs_vec_bit_identical(*params)
+            print(f"  [PASS] {name}")
+        except AssertionError as e:
+            failures += 1
+            print(f"  [FAIL] {name}: {e}")
+        except Exception as e:
+            failures += 1
+            print(f"  [ERROR] {name}: {type(e).__name__}: {e}")
+
     print(f"\n{'PASS' if failures == 0 else 'FAIL'}  ({failures} failure(s))")
     raise SystemExit(0 if failures == 0 else 1)

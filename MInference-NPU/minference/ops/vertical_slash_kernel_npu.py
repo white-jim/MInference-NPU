@@ -90,7 +90,7 @@ def _pad_head_dim(t: torch.Tensor, target_d: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _build_vs_mask_from_indexes(
+def _build_vs_mask_from_indexes_loop(
     block_count: torch.Tensor,   # [B, H, num_rows]  CPU int32
     block_offset: torch.Tensor,  # [B, H, num_rows, NNZ_S]  CPU int32
     column_count: torch.Tensor,  # [B, H, num_rows]  CPU int32
@@ -100,7 +100,11 @@ def _build_vs_mask_from_indexes(
     device: torch.device,
     block_size: int = _DEFAULT_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """从 convert_vertical_slash_indexes 输出构建 token 级 attention mask。
+    """Loop 版（v1 实现）。保留作为 vec 版的黄金参考 + bit-identical 对照。
+
+    v2 PR-2 起生产路径切到 :func:`_build_vs_mask_from_indexes_vec`，此函数仅在
+    ``tests/test_minference_batched_vs.py::test_loop_vs_vec_bit_identical`` 中
+    被显式调用。
 
     Returns:
         mask [B, H, S_q, S_k]，bool，True = 被遮蔽（NPU 惯例）。
@@ -117,7 +121,6 @@ def _build_vs_mask_from_indexes(
                 if start_q >= S_q:
                     break
                 end_q = min(start_q + block_size, S_q)
-                block_rows = end_q - start_q
 
                 q_rows = torch.arange(start_q, end_q, device=device, dtype=torch.long)  # [br]
 
@@ -157,6 +160,91 @@ def _build_vs_mask_from_indexes(
                 mask[b, h, start_q:end_q, :] &= ~attend_2d
 
     return mask
+
+
+def _build_vs_mask_from_indexes_vec(
+    block_count: torch.Tensor,   # [B, H, num_rows]   int32（CPU 或 device）
+    block_offset: torch.Tensor,  # [B, H, num_rows, NNZ_S]  int32
+    column_count: torch.Tensor,  # [B, H, num_rows]   int32
+    column_index: torch.Tensor,  # [B, H, num_rows, NNZ_V]  int32
+    S_q: int,
+    S_k: int,
+    device: torch.device,
+    block_size: int = _DEFAULT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """向量化版（v2 PR-2）。消除 (b, h, bq) 三重 Python 循环 + 4096 次小 NPU launch。
+
+    与 :func:`_build_vs_mask_from_indexes_loop` 数值 bit-identical（True 在每个
+    位置完全一致），由 ``test_loop_vs_vec_bit_identical`` 验证。
+
+    设计要点：
+      1. **Slash cumsum 区间标记** —— 在 [B, H, num_rows, S_k+1] 张量上一次性
+         ``scatter_add_(+1)`` 起点 + ``scatter_add_(-1)`` 终点，然后 ``cumsum > 0``。
+         无效位（i >= block_count）的起/终点同放在 sentinel S_k 上，+1/-1 抵消。
+      2. **Vertical scatter** —— 用 int32 ``scatter_add_(v_valid.int())`` + ``> 0``，
+         避免 bool scatter_ 在重复列上的覆写歧义。无效位 column_index 为 0
+         （由 convert 阶段的 ``torch.zeros`` 初始化），其 v_valid=0 散布 0，无副作用。
+      3. **Block → Token 展开** —— ``combined.repeat_interleave(block_size, dim=-2)``
+         把 num_rows 维展开成 S_q 维，再 ``[..., :S_q, :]`` 截断处理 num_rows*block
+         略大于 S_q 的边界。
+      4. **因果** —— 与 j_range[None,:] <= i_range[:,None] 一次性与起来。
+    """
+    B, H, num_rows = block_count.shape
+    NNZ_S = block_offset.shape[-1]
+    NNZ_V = column_index.shape[-1]
+
+    # 统一搬到目标 device（convert_vertical_slash_indexes 在 CPU 产 int32）
+    block_count_d = block_count.to(device=device, dtype=torch.long)         # [B,H,R]
+    block_offset_d = block_offset.to(device=device, dtype=torch.long)       # [B,H,R,NNZ_S]
+    column_count_d = column_count.to(device=device, dtype=torch.long)       # [B,H,R]
+    column_index_d = column_index.to(device=device, dtype=torch.long)       # [B,H,R,NNZ_V]
+
+    # ---- Slash 覆盖：cumsum 区间标记 ----
+    s_arange = torch.arange(NNZ_S, device=device).view(1, 1, 1, NNZ_S)
+    s_valid = s_arange < block_count_d.unsqueeze(-1)                        # [B,H,R,NNZ_S]
+
+    blk_starts = block_offset_d.clamp(0, S_k)                               # [B,H,R,NNZ_S]
+    blk_ends = (block_offset_d + block_size).clamp(0, S_k)                  # [B,H,R,NNZ_S]
+
+    # 无效位的 start/end 都放在 sentinel=S_k；scatter +1/-1 互相抵消，不污染 [:S_k]
+    SENTINEL = S_k
+    sentinel_t = torch.full_like(blk_starts, SENTINEL)
+    blk_starts = torch.where(s_valid, blk_starts, sentinel_t)
+    blk_ends = torch.where(s_valid, blk_ends, sentinel_t)
+
+    cov_delta = torch.zeros(B, H, num_rows, S_k + 1, dtype=torch.int32, device=device)
+    ones_int = torch.ones_like(blk_starts, dtype=torch.int32)
+    cov_delta.scatter_add_(-1, blk_starts, ones_int)
+    cov_delta.scatter_add_(-1, blk_ends, -ones_int)
+    slash_cov = cov_delta.cumsum(-1)[..., :S_k] > 0                         # [B,H,R,S_k]
+
+    # ---- Vertical 覆盖：int scatter_add + > 0（避开 bool scatter 覆写歧义） ----
+    v_arange = torch.arange(NNZ_V, device=device).view(1, 1, 1, NNZ_V)
+    v_valid = (v_arange < column_count_d.unsqueeze(-1)).to(torch.int32)     # [B,H,R,NNZ_V]
+    cols = column_index_d.clamp(0, S_k - 1)                                 # [B,H,R,NNZ_V]
+    vert_int = torch.zeros(B, H, num_rows, S_k, dtype=torch.int32, device=device)
+    vert_int.scatter_add_(-1, cols, v_valid)
+    vert_cov = vert_int > 0                                                 # [B,H,R,S_k]
+
+    combined = slash_cov | vert_cov                                         # [B,H,R,S_k]
+
+    # ---- num_rows → S_q 展开 ----
+    # combined[b, h, bq, j] 描述 "query block bq 对 KV 位置 j 是否可见（不含因果）"
+    combined_per_q = combined.repeat_interleave(block_size, dim=-2)         # [B,H,R*BLK,S_k]
+    combined_per_q = combined_per_q[..., :S_q, :]                           # [B,H,S_q,S_k]
+
+    # ---- 因果约束 ----
+    i_range = torch.arange(S_q, device=device).view(S_q, 1)
+    j_range = torch.arange(S_k, device=device).view(1, S_k)
+    causal = j_range <= i_range                                             # [S_q, S_k] bool
+
+    attend = combined_per_q & causal                                        # [B,H,S_q,S_k]
+    mask = ~attend                                                          # True = masked
+    return mask
+
+
+# v2 PR-2：生产路径走向量化版；旧 loop 实现仅在测试中显式调用。
+_build_vs_mask_from_indexes = _build_vs_mask_from_indexes_vec
 
 
 # ---------------------------------------------------------------------------
