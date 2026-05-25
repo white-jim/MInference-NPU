@@ -98,8 +98,10 @@ def _naive_streaming(
 # (n_init, n_local, s_q, s_k, description)
 _STREAMING_CASES = [
     # 短路：k_len <= n_local → dense（streaming_forward 走 dense 分支）
+    # 注意：prefill 场景 s_q == s_k；s_q > s_k 会让 causal 下前 (s_q-s_k) 个 query
+    # 看不到任何 key，softmax(-inf) → nan，并非被测代码 bug 而是用例本身不合法。
     (64, 512, 256, 256, "short_circuit_klen_eq_nlocal"),
-    (64, 512, 256, 128, "short_circuit_klen_lt_nlocal"),
+    (64, 512, 128, 128, "short_circuit_klen_lt_nlocal"),
     # 边界：k_len = n_local + 1（刚好触发 streaming 路径）
     (4, 8, 9, 9, "boundary_klen_eq_nlocal_p1"),
     # n_init = 0：无 sink，只有 sliding window

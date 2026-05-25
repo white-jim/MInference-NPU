@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` 实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）。
+> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` 实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）；streaming kernel 段 1 `sparse_mode=4`→`sparse_mode=1+显式 mask`（§9.3，待实机复测）。
 > 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -160,3 +160,15 @@ M5 不引入新代码，只做实机验证：
 **修正**：`minference/modules/minference_forward.py::forward` 所有参数改默认值，名字对齐新签名，加 `cache_position` / `position_embeddings` 命名参数，返回 2-tuple；`past_key_value`（单数）旧版通过 kwargs 兜底。
 
 **测试 3 副作用**：`accelerate.dispatch_model` 在 NPU 上 AlignDevicesHook 没把 CPU input_ids 自动搬到 embed 卡 → 测试侧改成显式 `.to(embed_device)`。另外 `infer_auto_device_map` 在 8×NPU + tiny 4 层模型下把 device_map 压成 `{'': 0}` 单卡，**该测试目前未真正覆盖跨卡 forward**；M5 报告里需补一组 `max_memory` 强制切层的 case。
+
+### 9.3 streaming kernel 段 1 `sparse_mode=4` 同款不靠谱（2026-05-25）
+
+**触发**：`python -m pytest tests/test_streaming_kernel.py` 在 NPU 上 3 个 `test_npu_vs_pytorch_ref` 全 FAIL（max_abs_diff 1.28e-01 ~ 4.00e-01）；同时 `short_circuit_klen_lt_nlocal` 2 个 case nan FAIL（与下文无关，是测试用例 `s_q>s_k` 在 causal 下整行 -inf → softmax nan，已把用例改为 `s_q==s_k`）。
+
+**根因**：`_streaming_npu` 段 1 原本走 `sparse_mode=4 + pre_tockens=n_local-1, next_tockens=0` 表达 sliding-window band，但 CANN 8.1.RC1 下 `sparse_mode=4` 与 §9.1 的 `sparse_mode=2` 同款 —— 不按文档语义生效，退化成 full attention，于是 sliding-window 被忽略，段 1 输出 ≠ 期望。
+
+**修正**：段 1 改成 `sparse_mode=1 + 显式 [1,1,S_q,S_k] bool atten_mask`（`True=屏蔽`，与 M3/M4/段 2 一致），`try/except TypeError` 兜底 uint8。新增 `l1 = nan_to_num(l1, 0.0)` 与段 2 对齐，防御 LSE 合并的极端 nan。已修 `ops/streaming_kernel_npu.py::_streaming_npu` + 顶部 docstring。
+
+**显存代价**：mask `[1,1,S_q,S_k]` 在 S=16384 内单测无压力；S>16384 已由 P7 silent dense fallback 兜底，本次不动。CANN 升 8.2+ 时可复测 `sparse_mode=4`，命中后回滚省 mask。
+
+**仍需盯**：M3 block-sparse / M4 vertical-slash 的 NPU 段已经全程显式 mask，理论上不踩此坑；M5 跑 `tests/test_block_sparse_kernel.py` + `tests/test_vertical_slash_kernel.py` 时确认。

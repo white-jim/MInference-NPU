@@ -12,8 +12,11 @@
 
 NPU 实现路径（v1 PoC，与 `docs/migration_plan_v1.md §4` 一致）：
 
-* **段 1** — sliding-window-only：``npu_fusion_attention(sparse_mode=4, pre_tockens=n_local-1,
-  next_tockens=0)``，band 表达 sliding window。
+* **段 1** — sliding-window-only：``npu_fusion_attention(sparse_mode=1, atten_mask=...)``，
+  显式 ``[1,1,S_q,S_k]`` bool mask 表达 sliding window（``True=屏蔽``）。
+  历史上想用 ``sparse_mode=4 + pre/next_tockens`` 的 band 快路径，但 CANN 8.1.RC1
+  下 sparse_mode=2/4 实测均不生效（退化成 full attention，见 docs §9.1/§9.3），
+  v1 全部 causal/band 调用走 sparse_mode=1 + 显式 mask。
 * **段 2** — sink-only：仅前 ``n_init`` 个 key，用自定义 ``atten_mask`` 排除 sliding
   window 已经覆盖到的位置（complement-sliding-window 思路；mask 形状
   ``[1, 1, S_q, n_init]``，n_init=128 时内存可忽略）。
@@ -219,22 +222,44 @@ def _streaming_npu(
     s_k = k.shape[2]
     scale = 1.0 / math.sqrt(head_d)
 
-    # --- 段 1：sliding window only（band，sparse_mode=4） ---
-    # sparse_mode=4 语义：每个 query 看 [i - pre_tockens, i + next_tockens] 区间。
-    # 我们要的是 [i_abs - n_local + 1, i_abs]：pre_tockens=n_local-1，next_tockens=0。
-    pass1 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-        q,
-        k,
-        v,
-        head_num=n_heads,
-        input_layout="BNSD",
-        scale=scale,
-        sparse_mode=4,
-        pre_tockens=int(n_local) - 1,
-        next_tockens=0,
-    )
+    # --- 段 1：sliding window only（sparse_mode=1 + 显式 bool mask） ---
+    # §9.1 实测：CANN 8.1.RC1 下 sparse_mode=2/4 不按文档语义生效（退化成 full
+    # attention），唯一可靠的稀疏路径是 sparse_mode=1 + 用户显式 atten_mask。
+    # sliding 语义：query i 看 [i_abs - n_local + 1, i_abs]，i_abs = s_k - s_q + i。
+    abs_i = torch.arange(s_k - s_q, s_k, device=q.device)  # [s_q]
+    j_all = torch.arange(s_k, device=q.device)  # [s_k]
+    sliding_vis = (j_all[None, :] <= abs_i[:, None]) & (
+        j_all[None, :] > abs_i[:, None] - int(n_local)
+    )  # [s_q, s_k]，True=可见
+    sliding_mask = (~sliding_vis).to(torch.bool)[None, None, :, :]  # True=屏蔽
+
+    try:
+        pass1 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=sliding_mask,
+        )
+    except TypeError:
+        pass1 = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=n_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=sliding_mask.to(torch.uint8),
+        )
     # 文档定义返回元组：(attention_out, softmax_max, softmax_sum, softmax_out, seed, offset, numel)
     o1, m1, l1 = _unpack_fa_result(pass1, where="streaming pass1 (sliding window)")
+    # 极端情形下 sliding window 可能整行被屏蔽（s_q > s_k 等非法输入），与段 2 一致用
+    # nan_to_num 保护 LSE 合并；正常 prefill (s_q <= s_k) 不会触发。
+    l1 = torch.nan_to_num(l1, nan=0.0)
 
     if n_init <= 0:
         # 没有 sink，单段直接返回（仍要 cast 回输入 dtype；npu_fusion_attention 输出已对齐）
