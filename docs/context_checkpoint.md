@@ -289,3 +289,47 @@ M5 不引入新代码，只做实机验证：
 **所有前置项已 done（2026-05-25）**。v2 实质开发按 §11.3 推进，但 O(S²) mask 行的"零开发选项"已划掉 —— 见 §11.2。
 
 **关联 memory**：`project-minference-v1-perf-host-bound`、`project-minference-v1-mask-o-s2-ceiling`、`project-minference-npu-fa-sparse-mode-quirk`、`project-minference-v1-decisions`、`project-minference-ascend-migration`。
+
+
+## 12. v2 PR-1 + PR-2 进度（2026-05-25 当晚）
+
+### 12.1 已完成
+
+**PR-1：消除 forward 顶层 per-head Python 循环**
+- `minference/modules/minference_forward.py` —— `_vertical_and_slash_kernel` 入参支持 scalar 或长度 H 的 list/tensor（不同 head 用各自 vertical_size/slash_size 时走 V_max/S_max topk + duplicate-pad，保证 bit-identical）；forward 调度从 `for head in range(H)` 改为按 best_pattern 分组：vertical_and_slash heads 一次性 batched 调用，stream_llm / block_sparse 暂保留 per-head（占比 < 5%）
+- `tests/test_minference_batched_vs.py` —— T1 同尺寸 batched ⇔ per-head；T2 不同尺寸 list 入参 ⇔ per-head；T3 scalar ⇔ 单元素 list 向后兼容回归
+
+**PR-2：向量化 `_build_vs_mask_from_indexes`**
+- `minference/ops/vertical_slash_kernel_npu.py` —— 旧实现重命名为 `_build_vs_mask_from_indexes_loop`（作为黄金参考保留），新增 `_build_vs_mask_from_indexes_vec`；模块级别名 `_build_vs_mask_from_indexes = _vec`，调用方 `_vertical_slash_npu` / `_vertical_slash_pytorch_ref` 自动切换
+- 实现要点：用 `[B, H, num_rows, S_k]` 张量上的 `scatter_add_(±1) + cumsum > 0` 替代原 `for b: for h: for bq:` 三重 Python 循环；vertical 用 `int32 scatter_add + > 0` 避开 bool scatter 的覆写歧义；无效位用 sentinel=S_k 抵消，不污染 `[:S_k]` 切片
+- 测试 T4 验证 `_loop ⇔ _vec` 在多组 (B, H, S, NNZ_V, NNZ_S) 下 `torch.equal == True`
+
+**验证（NPU 服务器实测，env `flexhead`）**：
+- T1/T2/T3/T4 全部 PASS（bit-identical 闭环）
+- `pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py` 仍 93 passed，**零回归**
+
+### 12.2 8K prefill 性能曲线
+
+| 版本 | 8K + 4 decode 用时 | Δ vs v1 | 收益来源 |
+|---|---|---|---|
+| v1（per-head + Python mask loop） | 308.53 s | — | — |
+| v2 PR-1（batched VS） | 276.67 s | −32 s | 32 次 `npu_fusion_attention` launch 合并为 1 次 |
+| **v2 PR-2（vec mask build）** | **139.30 s** | **−169 s / 2.2×** | 4096 次/层的 host-bound 小 NPU launch → 几个大张量 op |
+
+`bit-identical` 维度全程未破，`pytest` 全程 93 passed。
+
+### 12.3 当前问题：剩余 139 s 仍 ~99% host-bound
+
+**纯 NPU 计算量估算**：H=32, S=8K, D=128, fp16, 32 层 ≈ 8 TFLOPS，910B 上 ~25 ms 计算 + 几十 ms HBM 带宽 → **真实 NPU 时间预计 < 200 ms**，对比实测 139 s **意味着 >99% 时间消耗在 host 侧**。
+
+**剩余瓶颈定位（未实测确认，待 profile 或下一轮改造验证）**：`minference/backend_npu/cuda_shim.py::convert_vertical_slash_indexes` 仍是纯 CPU Python 双指针：
+- 每层调一次，内部 `for b: for h: for bq:` = 1 × 32 × 128 = **4096 次** `_process_block` + `torch.tensor(blk_buf, int32)` 分配 + `block_count[b,h,bq] = n` CPU 张量元素写
+- × 32 层 = **每次 prefill ~131072 次** Python + CPU PyTorch iter
+- 这是 PR-2 之后**整条 v2 路径里唯一剩下的 Python 循环 / 唯一不在 NPU 上跑的算子**
+
+PR-1 / PR-2 完成后，热点链条已经从「外层 per-head 循环 → mask 构建三重循环」清空到「`convert_vertical_slash_indexes` 双指针」这唯一一处，定位明确。
+
+### 12.4 待解决
+
+- [ ] **PR-3（TODO）**：消除 `convert_vertical_slash_indexes` 的 host-bound CPU Python 双指针路径 —— 具体方案待评审，**记录方案前先在 NPU 上量一发 `--attn-type dense` 8K 基线确认天花板**
+- [ ] 待 PR-3 完成后，更新本节性能表 + 决定是否进入 P1（长上下文 16K 内存 / 序列并行）或 P2（stream_llm / block_sparse 也 batch 化）
