@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` 实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）；streaming kernel 段 1 `sparse_mode=4`→`sparse_mode=1+显式 mask`（§9.3，待实机复测）。
+> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` + `test_streaming_kernel`（32/32，含 3 个 NPU case）实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）；streaming kernel 段 1 `sparse_mode=4`→`sparse_mode=1+显式 mask`（§9.3）。
 > 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -40,7 +40,7 @@
 [x] M4 Vertical-Slash kernel（M4-a CPU 双指针 + M4-b NPU mask） 详见 docs/M4_vertical_slash.md
 [x] Bug 修复 首轮（B1-B5/P3/P4，2026-05-24）
 [x] Bug 修复 第二轮（B6-B9，2026-05-25）
-[~] M5 端到端联调 + 精度/性能/效果报告（test_env + test_dense_forward PASS；streaming/block/vs 待跑）
+[~] M5 端到端联调 + 精度/性能/效果报告（test_env + test_dense_forward + test_streaming_kernel PASS；block/vs 待跑）
 [ ] docs/migration_v1_notes.md + docs/migration_v1_report.md
 ```
 
