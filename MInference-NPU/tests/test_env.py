@@ -168,18 +168,35 @@ def test_npu_fusion_attention_smoke(verbose: bool = False) -> bool:
         k = torch.randn(B, N, S, D, dtype=dtype, device=dev)
         v = torch.randn(B, N, S, D, dtype=dtype, device=dev)
 
-        # npu_fusion_attention 接口（BNSD layout，sparse_mode=2 表示 causal）
-        # 参考 torch_npu 文档：返回 (attention_out, softmax_max, softmax_sum, ...)
-        # 不同 torch_npu 小版本返回元组长度可能略有差异，只取第一个即可
-        result = torch_npu.npu_fusion_attention(
-            q,
-            k,
-            v,
-            head_num=N,
-            input_layout="BNSD",
-            scale=scale,
-            sparse_mode=2,  # 2 = causal triangular
-        )
+        # npu_fusion_attention 接口（BNSD layout）。
+        # 注意：CANN 8.1.RC1 + torch_npu 2.5.1 实测下，sparse_mode=0/2 不传 atten_mask
+        # 都退化为 full attention（即使 sparse_mode=2 标称 causal）。要拿到正确 causal
+        # 必须 sparse_mode=1 + 显式 bool atten_mask（True=masked，NPU 惯例）。
+        # 详见 docs/SETUP.md §5 与 ../../docs/context_checkpoint.md。
+        # 返回 (attention_out, softmax_max, softmax_sum, ...)，只取第一个。
+        causal_mask = torch.ones(S, S, device=dev, dtype=torch.bool).triu(diagonal=1)
+        try:
+            result = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=N,
+                input_layout="BNSD",
+                scale=scale,
+                sparse_mode=1,
+                atten_mask=causal_mask,
+            )
+        except TypeError:
+            result = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=N,
+                input_layout="BNSD",
+                scale=scale,
+                sparse_mode=1,
+                atten_mask=causal_mask.to(torch.uint8),
+            )
         out_npu = result[0] if isinstance(result, (tuple, list)) else result
 
         # 参考输出在 NPU 上算（fp32 中间，避免比对时的设备一致性问题）

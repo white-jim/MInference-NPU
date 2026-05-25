@@ -10,8 +10,9 @@
 - 移除 KV 压缩（`minference_patch_with_kvcompress`）—— v1 排除项
 - 移除 inf_llm / chatglm 特殊路径 —— v1 范围 Llama / Qwen / Mistral 已够
 - 不替换 `LlamaModel.forward` / `LlamaForCausalLM.forward` —— 上游替换是为了 bypass HF
-  的 causal mask 构造 + 注入 flash_attn 特定逻辑；NPU 上 `npu_fusion_attention` 用
-  `sparse_mode=2` 自带 causal，HF 默认 forward 就能正常工作
+  的 causal mask 构造 + 注入 flash_attn 特定逻辑；NPU 上 `backend_npu.dense_attention`
+  自己构造 causal mask 走 `sparse_mode=1`（见 docs/SETUP.md §5.1），HF 默认 forward
+  就能正常工作
 
 保留：
 - `minference_patch(model, config)` —— 主入口，monkey-patch LlamaAttention.forward

@@ -124,8 +124,25 @@ python tests/test_env.py --with-triton -v
 | `import torch_npu` 报 `libascendcl.so not found` | 没 `source set_env.sh` | 见 §3.1 step 4，写进 `~/.bashrc` |
 | `npu-smi info` 看不到卡 | 驱动未装 / 固件不匹配 | 重装 Ascend HDK |
 | triton kernel 编译报 `unsupported builtin` | triton-ascend 与 torch_npu / CANN 版本不匹配 | CANN 8.1.RC1 下先不要安装/启用 Triton-Ascend；升级到匹配矩阵后再测 |
-| `npu_fusion_attention` 返回 NaN | dtype 是 fp32 / 非 2 的幂 head_dim / mask shape 不对 | 走 bf16；head_dim 取 64/128；mask 用 `sparse_mode` 而非显式 mask |
+| `npu_fusion_attention` 返回 NaN | dtype 是 fp32 / 非 2 的幂 head_dim | 走 bf16/fp16；head_dim 取 64/128 |
+| `test_npu_fusion_attention_smoke` 报 `max_abs_diff≈3.6`（≈full attention） | **CANN 8.1.RC1 + torch_npu 2.5.1 下 `sparse_mode=0/2` 不传 `atten_mask` 都退化为 full attention**，即使 `sparse_mode=2` 标称 causal | causal 路径统一改成 `sparse_mode=1 + 显式 bool atten_mask`（`True=masked`，NPU 惯例）。已在 `backend_npu/attention.py` 与 `tests/test_env.py` 落地，详见下方 §5.1。 |
 | accelerate 切层后挂 device mismatch | 代码里有 hard-code `npu:0` / `tensor.cuda()` | 全部改成 device-agnostic（plan §0 约束 2） |
+
+### 5.1 sparse_mode causal 语义在 CANN 8.1.RC1 的实测结论
+
+实测组合（B=1, N=4, S=256, D=128, fp16）：
+
+| 调用 | 与手写 PyTorch eager causal 参考的 `max_abs_diff` | 实际语义 |
+|---|---|---|
+| `sparse_mode=0`（无 mask） | ~3.6 | full attention |
+| `sparse_mode=2`（无 mask） | ~3.6 | full attention（非 causal） |
+| `sparse_mode=2 + pre_tockens/next_tockens` | ~3.6 | full attention |
+| **`sparse_mode=1 + 显式 [S_q, S_k] bool atten_mask`** | **~0.00195（mean~2e-5）** | **正确 causal** |
+
+结论：路径 A 的所有 dense / 稀疏 causal 调用都走 `sparse_mode=1 + 显式 atten_mask`。
+- bool mask 约定：`True = masked out`（与 M3/M4 的 `_block_sparse_npu` / `_vertical_slash_npu` 保持一致）。
+- 个别 torch_npu 小版本只接受 `uint8` mask，已经在调用点用 `try/except TypeError` 兜底转换。
+- 该结论待 CANN 升级到 8.2+/torch_npu 2.6 线时复测；若届时 `sparse_mode=2` 行为修正，可回滚到无 mask 写法以省 `[S_q, S_k]` 显存。
 
 ---
 

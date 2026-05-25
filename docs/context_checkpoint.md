@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — M0–M4 全部完成，两轮 bug 修复全部清完，下一步进 M5 实机联调。
+> 最近更新：2026-05-25 — M0–M4 全部完成，两轮 bug 修复全部清完；M5 实机联调启动，发现 CANN 8.1.RC1 + torch_npu 2.5.1 下 `npu_fusion_attention(sparse_mode=2)` 不传 `atten_mask` 退化为 full attention，已将 `backend_npu/attention.py` + `tests/test_env.py` 改成 `sparse_mode=1` + 显式 bool causal mask（见 §9）。
 > 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -123,3 +123,27 @@ M5 不引入新代码，只做实机验证：
 | P9 | `modules/minference_forward.py` | GQA/MQA 用 `repeat_kv` 物理复制，长上下文放大 KV 工作量 |
 
 性能修复决策原则：M5 拿到真实瓶颈再动，不预先重构。
+
+---
+
+## 9. M5 实机踩坑记录
+
+### 9.1 `npu_fusion_attention` 的 `sparse_mode` 在 CANN 8.1.RC1 下不靠谱（2026-05-25）
+
+**触发**：`python tests/test_env.py -v` 中 `test_npu_fusion_attention_smoke` FAIL，`max_abs_diff=3.633e+00`，差异跟"causal 期望 vs full attention 实测"对得上。
+
+**实测组合**（B=1, N=4, S=256, D=128, fp16，与手写 PyTorch eager causal 比对）：
+
+| 调用 | `max_abs_diff` | 实际语义 |
+|---|---|---|
+| `sparse_mode=0`（无 mask） | ~3.6 | full attention |
+| `sparse_mode=2`（无 mask） | ~3.6 | full attention（**不是** causal） |
+| `sparse_mode=2 + pre_tockens/next_tockens` | ~3.6 | full attention |
+| `sparse_mode=1 + 显式 [S_q, S_k] bool atten_mask` | ~0.00195（mean ~2e-5） | 正确 causal |
+
+**修正**：路径 A 全部 causal 调用统一走 `sparse_mode=1 + 显式 bool atten_mask`（`True=masked`，与 M3/M4 已落地的约定一致），调用点用 `try/except TypeError` 兜底 `uint8` 版本。
+
+**影响范围**：
+- 已修：`MInference-NPU/minference/backend_npu/attention.py` 的 `dense_attention()`；`MInference-NPU/tests/test_env.py` 的 smoke test；`MInference-NPU/docs/SETUP.md` §5/§5.1。
+- 待复查：CANN 升级到 8.2+/torch_npu 2.6 线时复测 `sparse_mode=2`，若行为修正可回滚省 `[S_q, S_k]` 显存。
+- 不受影响：M2/M3/M4 kernel 本来就走 `sparse_mode=1 + 显式 mask`；`streaming_kernel_npu.py` 的 sliding-window 段用 `sparse_mode=4`，未实测过，M5 跑 `tests/test_streaming_kernel.py` 时盯一下。

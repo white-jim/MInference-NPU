@@ -350,8 +350,8 @@ def streaming_forward(
 
     # 短路：sliding window 覆盖所有 K → causal dense
     if s_k <= int(n_local):
-        # 复用 backend_npu.dense_attention（NPU 上 npu_fusion_attention sparse_mode=2；
-        # 非 NPU 上自动走 PyTorch eager）；避免循环 import 用延迟导入
+        # 复用 backend_npu.dense_attention（NPU 上 npu_fusion_attention sparse_mode=1
+        # + 显式 causal mask；非 NPU 上自动走 PyTorch eager）；避免循环 import 用延迟导入
         from ..backend_npu import dense_attention
 
         out = dense_attention(q, k, v, causal=True)

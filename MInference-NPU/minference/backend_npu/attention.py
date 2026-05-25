@@ -107,15 +107,53 @@ def dense_attention(
         return _eager_attention_cpu_ref(q, k, v, scale, causal)
 
     num_heads = q.size(1)
-    result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-        q,
-        k,
-        v,
-        head_num=num_heads,
-        input_layout="BNSD",
-        scale=scale,
-        sparse_mode=2 if causal else 0,  # 2 = causal triangular
+
+    # CANN 8.1.RC1 + torch_npu 2.5.1 实测：sparse_mode=0/2 在不传 atten_mask 时
+    # 都退化为 full attention（即使 sparse_mode=2 标称 causal）。要拿到正确 causal
+    # 语义必须 sparse_mode=1 + 显式 bool atten_mask（True=masked，NPU 惯例）。
+    # 见 docs/SETUP.md §5 与 ../../docs/context_checkpoint.md。
+    if not causal:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=num_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=0,
+        )
+        return result[0] if isinstance(result, (tuple, list)) else result
+
+    s_q = q.size(-2)
+    s_k = k.size(-2)
+    # causal: 允许 j <= i + (s_k - s_q)；masked = upper triangle starting from
+    # diagonal = (s_k - s_q + 1)。与 M3/M4 kernel 的 True=masked 约定一致。
+    causal_mask = torch.ones(s_q, s_k, device=q.device, dtype=torch.bool).triu(
+        diagonal=s_k - s_q + 1
     )
+    try:
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=num_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=causal_mask,
+        )
+    except TypeError:
+        # 个别 torch_npu 小版本只接受 uint8 mask
+        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=num_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=causal_mask.to(torch.uint8),
+        )
     return result[0] if isinstance(result, (tuple, list)) else result
 
 
