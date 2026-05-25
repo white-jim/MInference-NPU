@@ -59,6 +59,7 @@ ENV/
 *.ipynb_checkpoints
 profile_default/
 ipython_config.py
+.obsidian/
 
 # ============================================================================
 # IDE / Editor
