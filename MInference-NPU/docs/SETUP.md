@@ -58,7 +58,8 @@ npu-smi info
 # 应看到 8 张 910B3，HBM 64GB
 
 # 4. source CANN 环境（建议写进 ~/.bashrc）
-source /usr/local/Ascend/ascend-toolkit/8.1.RC1/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# source 后 ASCEND_HOME_PATH 会指向 /usr/local/Ascend/ascend-toolkit/8.1.RC1
 ```
 
 ### 3.2 Python 虚拟环境
