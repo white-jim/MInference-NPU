@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — M5 起步：`test_env` 实机 PASS（fp16 max_abs_diff=1.953e-03）；途中发现并修复 CANN 8.1.RC1 下 `sparse_mode=2` 退化为 full attention 的坑（详见 §9.1）。
+> 最近更新：2026-05-25 — M5：`test_env` + `test_dense_forward` 实机 ALL PASS；修复 transformers 4.57.3 attention 新签名兼容（§9.2）。
 > 工作目录：`D:\works\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -40,7 +40,7 @@
 [x] M4 Vertical-Slash kernel（M4-a CPU 双指针 + M4-b NPU mask） 详见 docs/M4_vertical_slash.md
 [x] Bug 修复 首轮（B1-B5/P3/P4，2026-05-24）
 [x] Bug 修复 第二轮（B6-B9，2026-05-25）
-[~] M5 端到端联调 + 精度/性能/效果报告（test_env PASS；test_dense_forward 待跑）
+[~] M5 端到端联调 + 精度/性能/效果报告（test_env + test_dense_forward PASS；streaming/block/vs 待跑）
 [ ] docs/migration_v1_notes.md + docs/migration_v1_report.md
 ```
 
@@ -144,3 +144,19 @@ M5 不引入新代码，只做实机验证：
 **修正**：路径 A 全部 causal 调用改走 `sparse_mode=1 + 显式 bool atten_mask`（`True=masked`，与 M3/M4 既有约定一致），`try/except TypeError` 兜底 uint8。已修 `backend_npu/attention.py::dense_attention` + `tests/test_env.py` + `docs/SETUP.md` §5/§5.1。修正后实机 smoke max_abs_diff=1.953e-03，PASS。
 
 **仍需盯**：`streaming_kernel_npu.py` 的 sliding-window 段用 `sparse_mode=4`，未单独实测过同类问题，跑 `tests/test_streaming_kernel.py` 时复核精度。CANN 升到 8.2+ 时可复测 `sparse_mode=2` 决定是否回滚省 mask 显存。
+
+### 9.2 transformers 4.57.3 attention forward 签名变更（2026-05-25）
+
+**触发**：`tests/test_dense_forward.py` 3/3 FAIL，错误 `forward() missing 2 required positional arguments: 'past_key_value' and 'output_attentions'`。
+
+**根因**：transformers 4.57.3 `LlamaAttention.forward` 签名重写：
+- 位置 2 由 `attention_mask` 改为 `position_embeddings`
+- `past_key_value` → `past_key_values`（复数）
+- 删除 `output_attentions`（layer 不再传给 attention）
+- 返回值由三元组改为二元组 `(attn_output, attn_weights)`
+- `LlamaDecoderLayer` 改用全 kwargs 调 `self_attn`
+- `num_heads` / `num_key_value_heads` 不再挂在 attention module 实例上，需从 `self.config` 读
+
+**修正**：`minference/modules/minference_forward.py::forward` 所有参数改默认值，名字对齐新签名，加 `cache_position` / `position_embeddings` 命名参数，返回 2-tuple；`past_key_value`（单数）旧版通过 kwargs 兜底。
+
+**测试 3 副作用**：`accelerate.dispatch_model` 在 NPU 上 AlignDevicesHook 没把 CPU input_ids 自动搬到 embed 卡 → 测试侧改成显式 `.to(embed_device)`。另外 `infer_auto_device_map` 在 8×NPU + tiny 4 层模型下把 device_map 压成 `{'': 0}` 单卡，**该测试目前未真正覆盖跨卡 forward**；M5 报告里需补一组 `max_memory` 强制切层的 case。
