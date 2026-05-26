@@ -235,24 +235,19 @@ def run_block_sweep(verbose: bool = False) -> None:
             print(f"[sweep] npu_fa baseline FAIL: {e}")
             return
 
+        # 第二轮诊断：聚焦失败 case，打印完整错误 — 用来判断是否 tile-size 硬限
         block_pairs = [
-            (32, 32),
-            (64, 64),    # 默认
-            (64, 128),
-            (128, 64),
-            (128, 128),
-            (128, 256),
-            (256, 128),
-            (256, 256),
+            (64, 64),     # 已知 OK，作为锚点
+            (128, 64),    # 已知 FAIL — 复现并 dump 完整错误
+            (128, 128),   # 已知 FAIL — 复现并 dump 完整错误
         ]
 
         print("-" * 72)
         print(f"8K dense causal block sweep (npu_fa baseline = {t_npu:.2f} ms)")
         print("-" * 72)
-        print(f"{'BLOCK_M':<10}{'BLOCK_N':<10}{'triton(ms)':<14}{'ratio':<10}{'note':<20}")
-        print("-" * 72)
 
         for bm, bn in block_pairs:
+            print(f"\n>>> (BLOCK_M={bm}, BLOCK_N={bn})")
             def f(q, k, v, scale, _bm=bm, _bn=bn):
                 return triton_ascend_fa_dense(
                     q, k, v, sm_scale=scale, causal=True,
@@ -261,14 +256,21 @@ def run_block_sweep(verbose: bool = False) -> None:
             try:
                 t = _bench_one(f, q, k, v, scale, warmup=2, iters=5)
                 ratio = t / t_npu
-                print(f"{bm:<10}{bn:<10}{t:<14.2f}{ratio:<10.2f}")
+                print(f"    OK: {t:.2f} ms, ratio={ratio:.2f}")
             except Exception as e:  # noqa: BLE001
-                short = f"{e.__class__.__name__}: {str(e)[:60]}"
-                print(f"{bm:<10}{bn:<10}{'FAIL':<14}{'--':<10}{short:<20}")
+                print(f"    FAIL: {e.__class__.__name__}")
+                print("    ----- full error -----")
+                # 不截断 — 完整 MLIR 错误信息用来判断是否 codegen 硬限
+                err_str = str(e)
+                for line in err_str.splitlines()[:60]:  # 限 60 行避免淹没
+                    print(f"    {line}")
+                print("    ----- end error -----")
 
         print("-" * 72)
-        print("解读：找出 ratio 最小的 (BLOCK_M, BLOCK_N) — 多数 NPU FA kernel 实践")
-        print("      最优 tile 在 (128,64) / (128,128) / (256,128) 附近。")
+        print("诊断要点：")
+        print("  - 看 FAIL 的完整 MLIR 错误中是否提到 buffer / shared mem / register 超限")
+        print("  - 是否所有 BLOCK_M*BLOCK_D 或 BLOCK_N*BLOCK_D 超过某固定常数")
+        print("  - BLOCK_D=128（head_dim）是否是触发因素 — 决定能否通过减小 head_dim 绕过")
     except Exception as e:  # noqa: BLE001
         print(f"[sweep] FATAL: {e.__class__.__name__}: {e}")
         if verbose:
