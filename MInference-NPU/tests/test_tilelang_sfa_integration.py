@@ -246,7 +246,8 @@ def _compare(name: str, out_tl: torch.Tensor, out_ref: torch.Tensor, threshold: 
 # ---------------------------------------------------------------------------
 
 B = 1
-S = 512          # S_q = S_k
+S_Q = 128        # 官方 example kernel 的 Q 序列长度固定为 128
+S_K = 512        # 小尺寸 KV 长度，用于验证 Indices 语义
 H = 4            # Q heads
 KV_GROUP = 1     # 官方 example 当前 assert kv_group == 1；4 个 Q heads 共享同一 KV/Indices
 DIM = 128        # V 的维度 == output 维度
@@ -259,8 +260,8 @@ TOPK = 256       # 已知可编译；且给 early tokens 留足 pad sentinel 槽
 
 def _make_qkv(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
-    q = torch.randn(B, S, H, DIM + TAIL_DIM, dtype=torch.float16, device=device)
-    kv = torch.randn(B, S, KV_GROUP, DIM + TAIL_DIM, dtype=torch.float16, device=device)
+    q = torch.randn(B, S_Q, H, DIM + TAIL_DIM, dtype=torch.float16, device=device)
+    kv = torch.randn(B, S_K, KV_GROUP, DIM + TAIL_DIM, dtype=torch.float16, device=device)
     return q, kv
 
 
@@ -279,9 +280,9 @@ def run_sanity_case(sfa: Callable, device: torch.device) -> bool:
     topk = TOPK  # 必须 % BLOCK_I == 0
 
     # 与 example 同样的初始化方式：先全部填 S（作 pad sentinel），再随机选 valid
-    indices = torch.full((B, S, KV_GROUP, topk), S, dtype=torch.int32)
+    indices = torch.full((B, S_Q, KV_GROUP, topk), S_K, dtype=torch.int32)
     for b in range(B):
-        for t in range(S):
+        for t in range(S_Q):
             for g in range(KV_GROUP):
                 # 因果：Q at position t 看 K 位置 [0, t]，topk 个候选
                 max_valid = max(1, (t + Q_START) // KV_STRIDE)
@@ -316,7 +317,7 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     q, kv = _make_qkv(device)
     block_size_M = BLOCK_I
     block_size_N = BLOCK_I
-    n_q_blocks = S // block_size_M
+    n_q_blocks = S_Q // block_size_M
     max_blocks = TOPK // block_size_N
 
     # 每个 (b, h, q_block) 选 K block（anchor + trailing window）。
@@ -339,15 +340,15 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
 
     indices = block_indices_to_tilelang(
         block_indices,
-        S_q=S,
+        S_q=S_Q,
         block_size_M=block_size_M,
         block_size_N=block_size_N,
         kv_heads=KV_GROUP,
         block_count=block_count,
     )
-    indices = _pad_to_kernel_sentinel(indices, s_k=S).to(device)
+    indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
     topk = indices.shape[-1]
-    print(f"[bs] indices shape={tuple(indices.shape)} topk={topk} pad→{S}")
+    print(f"[bs] indices shape={tuple(indices.shape)} topk={topk} pad→{S_K}")
 
     kernel = _build_kernel(sfa, H, DIM, TAIL_DIM, topk, kv_group=KV_GROUP, block_I=BLOCK_I)
     try:
@@ -375,13 +376,13 @@ def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     n_init, n_local = 64, TOPK - 64
 
     indices = stream_llm_to_tilelang(
-        B=B, S_q=S, kv_heads=KV_GROUP,
+        B=B, S_q=S_Q, kv_heads=KV_GROUP,
         n_init=n_init, n_local=n_local, block_size_N=BLOCK_I,
         device="cpu",
     )
-    indices = _pad_to_kernel_sentinel(indices, s_k=S).to(device)
+    indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
     topk = indices.shape[-1]
-    print(f"[sl] indices shape={tuple(indices.shape)} topk={topk} pad→{S}")
+    print(f"[sl] indices shape={tuple(indices.shape)} topk={topk} pad→{S_K}")
 
     kernel = _build_kernel(sfa, H, DIM, TAIL_DIM, topk, kv_group=KV_GROUP, block_I=BLOCK_I)
     try:
