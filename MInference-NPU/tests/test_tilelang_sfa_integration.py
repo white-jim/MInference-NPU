@@ -35,13 +35,24 @@ import sys
 import traceback
 from typing import Callable, Optional
 
-# 自洽：把 MInference-NPU 仓库根（tests/ 的父目录）加进 sys.path，
-# 这样无论从哪里调用脚本都能 import minference.*
+# 自洽：把 MInference-NPU 仓库根（tests/ 的父目录）加进 sys.path
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
+
+# 绕开 minference/__init__.py（它会 eager import transformers，
+# flexhead-tl conda env 里没装）。直接按文件路径加载 tilelang_indices 子模块。
+import importlib.util as _ilu
+
+_TI_PATH = os.path.join(_REPO_ROOT, "minference", "ops", "tilelang_indices.py")
+_ti_spec = _ilu.spec_from_file_location("tilelang_indices_standalone", _TI_PATH)
+tilelang_indices = _ilu.module_from_spec(_ti_spec)
+_ti_spec.loader.exec_module(tilelang_indices)
+TILELANG_PAD_VALUE = tilelang_indices.TILELANG_PAD_VALUE
+block_indices_to_tilelang = tilelang_indices.block_indices_to_tilelang
+stream_llm_to_tilelang = tilelang_indices.stream_llm_to_tilelang
 
 # 让 pytest 不要把它当测试模块（脚本里 max_abs_diff 不用 assert）
 __test__ = False
@@ -221,11 +232,6 @@ def _call_sparse_attention_fwd(
 
 def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     """Block-sparse case：随机选 K block，验证我们的 block_indices → Indices 与 kernel 对接。"""
-    from minference.ops.tilelang_indices import (
-        TILELANG_PAD_VALUE,
-        block_indices_to_tilelang,
-    )
-
     print("\n" + "=" * 60)
     print("[case] BLOCK-SPARSE")
     print("=" * 60)
@@ -288,11 +294,6 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
 
 def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     """Stream-LLM case：固定 anchor + sliding window，验证 stream_llm_to_tilelang 与 kernel 对接。"""
-    from minference.ops.tilelang_indices import (
-        TILELANG_PAD_VALUE,
-        stream_llm_to_tilelang,
-    )
-
     print("\n" + "=" * 60)
     print("[case] STREAM-LLM (A-shape)")
     print("=" * 60)
