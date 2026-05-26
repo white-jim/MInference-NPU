@@ -31,6 +31,20 @@ import traceback
 
 import torch
 
+# triton-ascend 的 @triton.jit 走 func.__globals__ 找符号 — 把 triton/tl 放函数体里
+# 会让 `BLOCK_SIZE: tl.constexpr` 报 NameError('tl is not defined')（CUDA Triton 容忍，
+# triton-ascend 严格）。所以必须 module 级 import；Windows 等没 triton 的环境 ok，
+# 走 try/except，run-time 再判断。
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except Exception as _triton_import_err:  # noqa: BLE001 — 任何 import 失败都 skip
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
+    _TRITON_IMPORT_ERR = _triton_import_err
+
 
 # ----------------------------------------------------------------------------
 # 通用小工具
@@ -71,29 +85,37 @@ def _require_npu(verbose: bool) -> "torch.device":
 # ----------------------------------------------------------------------------
 
 
+# 必须在 module 级定义 — @triton.jit 走 func.__globals__ 解析 `tl.constexpr`，
+# 放函数内会报 NameError('tl is not defined')（triton-ascend 3.2.0 实测）。
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _vec_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+        tl.store(out_ptr + offsets, x + y, mask=mask)
+
+
 def test_triton_ascend_vector_add(verbose: bool = False) -> bool:
     name = "test_triton_ascend_vector_add"
+    if not _TRITON_AVAILABLE:
+        _print_status(
+            name,
+            False,
+            f"triton import failed at module load: {_TRITON_IMPORT_ERR}",
+        )
+        return False
     try:
         dev = _require_npu(verbose)
-
-        # triton-ascend 与 CUDA Triton 同名 import，由 torch_npu 注册后端切换
-        import triton
-        import triton.language as tl
-
-        @triton.jit
-        def _vec_add_kernel(
-            x_ptr,
-            y_ptr,
-            out_ptr,
-            n_elements,
-            BLOCK_SIZE: tl.constexpr,
-        ):
-            pid = tl.program_id(axis=0)
-            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_elements
-            x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-            y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-            tl.store(out_ptr + offsets, x + y, mask=mask)
 
         N = 8192
         BLOCK = 1024
