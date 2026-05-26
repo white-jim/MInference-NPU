@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-26 — **路径 A 弃用，v2 转向 triton-ascend（PR-4）**。PR-3 把 8K prefill 拉到 7.28s（vs dense 1.95s，3.73×），但 16K 实测 21.95s vs dense 4.68s（4.69×，差距扩大不收敛），且 O(S²) bool mask 在 128K 必 OOM —— **路径 A 是死胡同**：mask 路径不是真稀疏，计算量不减，永远比 dense 慢，长上下文又跑不动，**完全偏离 MInference 项目初衷**。用户 2026-05-26 拍板舍弃路径 A，环境升级到 CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0（B 选项），走 **triton-ascend 真稀疏 FA kernel**（PR-4，详见 §13）。
+> 最近更新：2026-05-26 — **路径 A 弃用，v2 转向 triton-ascend / tilelang-ascend 真稀疏 FA（PR-4）**。PR-3 把 8K prefill 拉到 7.28s（vs dense 1.95s，3.73×），但 16K 实测 21.95s vs dense 4.68s（4.69×，差距扩大不收敛），且 O(S²) bool mask 在 128K 必 OOM —— **路径 A 是死胡同**。用户升级到 CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0，并在 `flexhead-tl` 中跑通 tilelang 官方 `sparse_attention_fwd` 三个闸门 case：sanity / block-sparse / stream-llm 均 PASS（详见 §13.7）。当前仅需继续 A-shape 与 block-sparse 两种模式；剩余关键适配问题是 pad 不容错、`kv_group==1` 限制、标准 K/V 分离到官方 packed KV 语义的映射。
 > 工作目录：`D:\tempt\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -475,10 +475,60 @@ NPU 对应方案：**triton-ascend**（华为开源 Triton for Ascend）。
 
 → **不删除路径 A 代码，搬到 legacy/ 归档**。
 
+### 13.7 PR-4-tl-sfa 闸门（tilelang-ascend 官方 SFA 接口探针，2026-05-26）
+
+**目标**：在正式重写 A-shape / block-sparse kernel 前，先确认 tilelang-ascend 官方 `examples/sparse_flash_attention/example_sparse_flash_attn.py::sparse_attention_fwd` 的真实接口、输入顺序、indices 语义和精度上限。
+
+**实测环境**：NPU 服务器 env `flexhead-tl`，`PYTHONPATH=~/tilelang-ascend`。导入官方 example 会先跑其 top-level smoke test，日志里会出现 `init successful!` / `Test Passed!`，这是预期行为。
+
+**真实接口（已 probe）**：
+- 构造器签名：`sparse_attention_fwd(heads, dim, tail_dim, topk, kv_stride, kv_group=1, sm_scale=None, is_causal=True, block_I=64)`
+- kernel 调用：`kernel(q, kv, indices)` 三参数；`Output` 和 5 个 workspace 由 `@tilelang.jit(out_idx=[3], workspace_idx=[4,5,6,7,8])` 自动分配。
+- `q`: BSHD `[B, S_q, H, dim + tail_dim]`
+- `kv`: BSGD `[B, S_k, kv_group, dim + tail_dim]`，NSA/DeepSeek 风格 packed KV；reference 里 `k = kv`，`v = kv[..., :dim]`
+- `indices`: `[B, S_q, kv_group, topk]` int32，每项是 K token 位置，不是 block id
+- `out`: `[B, S_q, H, dim]`
+- 默认 `sm_scale = (dim + tail_dim) ** -0.5`
+- causal 参考的 `q_start_index_s` 默认是 `S_k * kv_stride - S_q`，即 Q 是 KV 尾部窗口。
+
+**当前已跑通的小尺寸闸门参数**：
+- `B=1, S_q=128, S_k=512, H=4, kv_group=1, dim=128, tail_dim=128, topk=256, block_I=64, kv_stride=1, q_start=384`
+- `KV_GROUP=1` 是官方 example 硬断言；当前不能直接表达 per-head MHA indices 或 GQA。
+- `topk` 列必须全部是有效 K token；实测 `pad=S_k` 会导致 tilelang kernel 输出 NaN。
+
+**已通过测试**（2026-05-26 用户实测）：
+| case | 命令 | 结果 |
+|---|---|---|
+| sanity | `PYTHONPATH=~/tilelang-ascend python tests/test_tilelang_sfa_integration.py --case sanity` | PASS，`max_abs_diff=4.8828e-04`, `mean_abs_diff=1.4170e-05` |
+| block-sparse | `PYTHONPATH=~/tilelang-ascend python tests/test_tilelang_sfa_integration.py --case bs` | PASS，`max_abs_diff=2.4414e-04`, `mean_abs_diff=1.4100e-05` |
+| stream-llm / A-shape | `PYTHONPATH=~/tilelang-ascend python tests/test_tilelang_sfa_integration.py --case sl` | PASS，`max_abs_diff=2.4414e-04`, `mean_abs_diff=1.4100e-05` |
+
+**代码状态**：
+- `MInference-NPU/tests/test_tilelang_sfa_integration.py` 已改成真实 `q, kv, indices` 三参数路径，并内置官方 reference 的参数化版本；该脚本是手跑 NPU 闸门，不作为 pytest collection 目标。
+- `MInference-NPU/minference/ops/tilelang_indices.py` 已有 `block_indices_to_tilelang` / `stream_llm_to_tilelang`，其中 stream-llm 对 anchor/local 重叠的 local 项填 `pad_value`，避免真实 sparse kernel 重复计入同一个 K token。
+- `MInference-NPU/tests/test_tilelang_indices.py` 已同步 stream-llm 重叠行为预期；但在 `flexhead-tl` 环境跑 `python -m pytest tests/test_tilelang_indices.py -v` 会因该 env 没装 `transformers` 而 collection 失败，因为测试直接 `from minference.ops...` 会触发 `minference/__init__.py` eager import。后续有两种处理：在 `flexhead-tl` 装 `transformers`，或把该测试改成像 `test_tilelang_sfa_integration.py` 一样按文件路径 standalone 加载 `tilelang_indices.py`。
+
+**与最终目标的差距（非常重要）**：
+1. 你当前只需要 **A-shape / stream-llm** 和 **block-sparse** 两种模式；tilelang 官方 SFA 是 NSA packed-KV kernel 原型，不是 MInference 标准 K/V 分离 attention 的 drop-in 替代。
+2. K/V 语义不同：MInference 标准输入是分离的 `q, k, v`；官方 kernel 是 packed `kv`，且 `v = kv[..., :dim]`。
+3. `kv_group==1` 限制：当前官方 example 只支持所有 Q heads 共享一组 KV/Indices，不能直接表达 per-head sparse pattern。
+4. pad 不容错：真实 A-shape / block-sparse 早期 token 或不足 topk 时天然有无效槽位，官方 kernel 目前遇到 `pad=S_k` 会 NaN。
+5. 因此下一步不是“直接替换”，而是先设计适配层：标准 K/V → packed KV、per-head pattern → shared/group indices、pad/不足 topk 的处理策略。
+
+**建议下一步顺序**：
+1. 先修 `tests/test_tilelang_indices.py` 的 standalone import，保证 `flexhead-tl` 无 transformers 也能跑 CPU-only indices 单测。
+2. 保持 PR-4 范围收窄：只做 A-shape 和 block-sparse，不做 vertical-slash。
+3. 优先 block-sparse：更容易构造满 `topk` 的有效 K block，先做共享 pattern MVP。
+4. 再做 A-shape：需要处理 early token、anchor/local 重叠和不足 topk 的策略。
+5. 决定 `kv_group==1` 的短期策略：共享 pattern MVP / per-group union / 修改 tilelang kernel 支持 `kv_group>1`。
+6. 决定 packed KV 策略：若要保持普通 attention 精确语义，官方 `v = kv[..., :dim]` 路径不够，需要改 kernel 支持独立 K/V，或另写更贴近 MInference 的 tilelang/triton kernel。
+
 ---
 
-## 14. 等用户做完环境升级（PR-4-env）回来执行的事
+## 14. 当前下一步（PR-4-tl-sfa 之后继续）
 
-- [ ] 在 NPU 服务器执行 §13.3 SOP（升 CANN 8.5.0 / 装 triton-ascend 3.2.0 / M1-M5 复测零回归）
-- [ ] 复测 `sparse_mode=2/4` 在 CANN 8.5.0 上的行为（可能修复或仍未修，影响弃用范围）
-- [ ] 把回归结果 + sparse_mode 复测结果回填本节，主对话据此启动 PR-4-poc
+- [x] NPU 服务器 `flexhead-tl` 已可导入 tilelang-ascend 官方 SFA，官方 smoke test PASS。
+- [x] PR-4-tl-sfa 三个闸门 case（sanity / block-sparse / stream-llm）均 PASS。
+- [ ] 修 `tests/test_tilelang_indices.py` 在 `flexhead-tl` 无 transformers 环境下的 import 问题。
+- [ ] 继续 PR-4 适配设计：只覆盖 A-shape 和 block-sparse，先不做 vertical-slash。
+- [ ] 明确三项关键设计：pad 处理、`kv_group==1`/per-head pattern 处理、标准 K/V 到 packed KV 的处理。
