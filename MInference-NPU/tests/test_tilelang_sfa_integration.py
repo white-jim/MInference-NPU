@@ -212,6 +212,23 @@ def _build_kernel(
 
 
 def _compare(name: str, out_tl: torch.Tensor, out_ref: torch.Tensor, threshold: float = 5e-2) -> bool:
+    tl_nan = torch.isnan(out_tl).sum().item()
+    ref_nan = torch.isnan(out_ref).sum().item()
+    tl_inf = torch.isinf(out_tl).sum().item()
+    ref_inf = torch.isinf(out_ref).sum().item()
+    if tl_nan or ref_nan or tl_inf or ref_inf:
+        print(
+            f"[{name}] non-finite: "
+            f"tl_nan={tl_nan} ref_nan={ref_nan} tl_inf={tl_inf} ref_inf={ref_inf}"
+        )
+        if tl_nan:
+            first = torch.nonzero(torch.isnan(out_tl), as_tuple=False)[0].tolist()
+            print(f"[{name}] first tl NaN index={first}")
+        if ref_nan:
+            first = torch.nonzero(torch.isnan(out_ref), as_tuple=False)[0].tolist()
+            print(f"[{name}] first ref NaN index={first}")
+        return False
+
     diff = (out_tl.float() - out_ref.float()).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
@@ -234,7 +251,7 @@ DIM = 128        # V 的维度 == output 维度
 TAIL_DIM = 128   # 已知 tilelang example 在 heads=4 时可编译的组合：Q/KV last dim = 256
 BLOCK_I = 64
 KV_STRIDE = 1
-Q_START = 0
+Q_START = S_K * KV_STRIDE - S_Q
 TOPK = 256       # 已知可编译；且给 early tokens 留足 pad sentinel 槽位
 
 
