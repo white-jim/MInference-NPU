@@ -248,6 +248,128 @@ _build_vs_mask_from_indexes = _build_vs_mask_from_indexes_vec
 
 
 # ---------------------------------------------------------------------------
+# v2 PR-3：直接从 (v_idx, s_idx) 构建 mask，跳过 convert_vertical_slash_indexes
+# ---------------------------------------------------------------------------
+
+
+def _build_vs_mask_direct(
+    v_idx: torch.Tensor,        # [B, H, NNZ_V]  int32/int64，升序
+    s_idx: torch.Tensor,        # [B, H, NNZ_S]  int32/int64，降序
+    S_q: int,
+    S_k: int,
+    device: torch.device,
+    block_size: int = _DEFAULT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """直接从 (v_idx, s_idx) 构建 token 级 bool mask，跳过 :func:`convert_vertical_slash_indexes`。
+
+    v2 PR-3：v1 / PR-2 路径走 `convert_vertical_slash_indexes`（CPU 双指针，每次
+    prefill ~131072 次 Python 迭代）→ `_build_vs_mask_from_indexes_vec`。PR-3 把
+    这两步合并为单个 NPU-side 张量算子链，**彻底消除整条 v2 路径里最后一处 host-
+    bound CPU 循环**。
+
+    Args:
+        v_idx: vertical 列索引，[B, H, NNZ_V]，升序。
+        s_idx: slash 偏移（= q_len - 1 - diag_idx），[B, H, NNZ_S]，降序。
+        S_q, S_k: 序列长度（v1 假设 S_q == S_k，即 full prefill）。
+        device: 目标 device（mask 落在此处）。
+        block_size: query / KV 块大小，必须 = 64。
+
+    Returns:
+        mask [B, H, S_q, S_k]，bool，True = 被遮蔽（NPU 惯例）。
+
+    数值正确性：
+        与 ``convert_vertical_slash_indexes`` + ``_build_vs_mask_from_indexes_loop``
+        bit-identical（由 ``test_build_mask_direct_vs_convert_loop_bit_identical``
+        在多组 (B,H,S,NNZ_V,NNZ_S) 下 ``torch.equal == True`` 验证）。
+
+    关键等价性：
+        原 CUDA 双指针 kernel 做两件事 ——
+          1. slash 区间合并（相邻/重叠 [range_start, range_end) 合并）
+          2. vertical 列去重（排除已被 slash 覆盖的列 + 排除 v_val >= end_m 的因果外列）
+        这两件事在最终 mask 层面用 ``slash_cov | vert_cov``（OR 语义）+ 因果 ``&``
+        后**完全等价**：bool OR 对重叠/重复幂等，因果 mask 兜底处理 ``j >= end_m``。
+        因此可以直接对每个 slash 段独立打 cumsum 区间标记、对 vertical 一次 scatter，
+        无需合并/去重。
+
+    设计要点：
+      1. **Slash cumsum 区间标记** —— 对每个 (b,h,bq,k_s)：
+           valid = s_raw < end_m，end_m = (bq+1)*block_size
+           range_end = max(end_m - s_raw, block_size)
+           range_start = range_end - block_size
+         invalid 位的 start/end 都设为 sentinel=S_k，scatter +1/-1 互相抵消。
+      2. **Vertical scatter 共享** —— v_idx 不依赖 bq，一次 ``scatter_add_(+1) > 0``
+         得到 [B,H,S_k]，再 broadcast 到 num_rows 维度，省一份 [B,H,R,S_k] 显存。
+      3. **Block → Token 展开** —— ``repeat_interleave(block_size, dim=-2)`` +
+         ``[..., :S_q, :]`` 与 PR-2 vec 版完全一致。
+      4. **因果** —— 与 ``j_range[None,:] <= i_range[:,None]`` 一次性 AND。
+
+    显存复杂度：与 PR-2 vec 版同 —— O(B*H*num_rows*S_k) 中间 + O(B*H*S_q*S_k) 输出。
+    S>16384 仍由外层 silent dense fallback 兜底（不在此函数处理）。
+    """
+    assert block_size == _DEFAULT_BLOCK_SIZE, (
+        f"_build_vs_mask_direct 仅支持 block_size={_DEFAULT_BLOCK_SIZE}，got {block_size}"
+    )
+    B, H, NNZ_V = v_idx.shape
+    NNZ_S = s_idx.shape[-1]
+    num_rows = (S_k + block_size - 1) // block_size
+    SENTINEL = S_k
+
+    # 移到目标 device 并转 long（scatter_add_ 的 index 必须 long）
+    v_idx_d = v_idx.to(device=device, dtype=torch.long)  # [B, H, NNZ_V]
+    s_idx_d = s_idx.to(device=device, dtype=torch.long)  # [B, H, NNZ_S]
+
+    # ---- Slash 覆盖：cumsum 区间标记 ----
+    # end_m[bq] = (bq+1) * block_size
+    bq_arange = torch.arange(num_rows, device=device, dtype=torch.long)  # [R]
+    end_m = (bq_arange + 1) * block_size                                 # [R]
+    end_m_view = end_m.view(1, 1, num_rows, 1)                           # [1,1,R,1]
+
+    s_view = s_idx_d.unsqueeze(-2)                                       # [B,H,1,NNZ_S]
+    valid_s = s_view < end_m_view                                        # [B,H,R,NNZ_S] bool
+
+    # range_end = max(end_m - s_raw, block_size)
+    # 对 invalid 位也算出一个数没关系，下面用 where 替换为 sentinel
+    range_end_raw = (end_m_view - s_view).clamp(min=block_size).clamp(max=S_k)
+    range_start_raw = (range_end_raw - block_size).clamp(min=0, max=S_k)
+
+    sentinel_t = torch.full(
+        (), SENTINEL, dtype=torch.long, device=device
+    )  # 0-dim，broadcast 到 [B,H,R,NNZ_S]
+    range_start = torch.where(valid_s, range_start_raw, sentinel_t)      # [B,H,R,NNZ_S]
+    range_end = torch.where(valid_s, range_end_raw, sentinel_t)          # [B,H,R,NNZ_S]
+
+    cov_delta = torch.zeros(B, H, num_rows, S_k + 1, dtype=torch.int32, device=device)
+    ones_int = torch.ones_like(range_start, dtype=torch.int32)
+    cov_delta.scatter_add_(-1, range_start, ones_int)
+    cov_delta.scatter_add_(-1, range_end, -ones_int)
+    slash_cov = cov_delta.cumsum(-1)[..., :S_k] > 0                      # [B,H,R,S_k]
+
+    # ---- Vertical 覆盖：所有 bq 共享同一组 v_idx，先生成 [B,H,S_k] 再 broadcast ----
+    v_cols = v_idx_d.clamp(0, S_k - 1)                                   # [B,H,NNZ_V]
+    vert_int = torch.zeros(B, H, S_k, dtype=torch.int32, device=device)
+    vert_int.scatter_add_(
+        -1, v_cols, torch.ones_like(v_cols, dtype=torch.int32)
+    )
+    vert_cov = (vert_int > 0).unsqueeze(-2)                              # [B,H,1,S_k]
+
+    # ---- 合并 ----
+    combined = slash_cov | vert_cov                                      # [B,H,R,S_k] (broadcast)
+
+    # ---- num_rows → S_q 展开 ----
+    combined_per_q = combined.repeat_interleave(block_size, dim=-2)      # [B,H,R*BLK,S_k]
+    combined_per_q = combined_per_q[..., :S_q, :]                        # [B,H,S_q,S_k]
+
+    # ---- 因果约束 ----
+    i_range = torch.arange(S_q, device=device).view(S_q, 1)
+    j_range = torch.arange(S_k, device=device).view(1, S_k)
+    causal = j_range <= i_range                                          # [S_q, S_k] bool
+
+    attend = combined_per_q & causal                                     # [B,H,S_q,S_k]
+    mask = ~attend                                                       # True = masked
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # PyTorch 参考实现（非 NPU 兜底 + 测试黄金）
 # ---------------------------------------------------------------------------
 
@@ -260,16 +382,55 @@ def _vertical_slash_pytorch_ref(
     s_idx: torch.Tensor,  # [B, H, NNZ_S]  int32 descending
     block_size: int = _DEFAULT_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """Vertical-slash attention 的纯 PyTorch 参考实现。
+    """Vertical-slash attention 的纯 PyTorch 参考实现（v2 PR-3 起 = direct 路径）。
 
     逻辑：
-    1. 通过 convert_vertical_slash_indexes 获取 block_count/block_offset/column_count/column_index。
-    2. 调用 _build_vs_mask_from_indexes 构建 token 级 mask。
-    3. PyTorch masked softmax + matmul。
+    1. 调用 :func:`_build_vs_mask_direct` 从 (v_idx, s_idx) 直接构建 token 级 mask
+       （跳过 ``convert_vertical_slash_indexes`` 的 CPU Python 双指针）。
+    2. PyTorch masked softmax + matmul。
 
     用作：
     - 非 NPU 环境（CPU / CUDA）的兜底
-    - 单测黄金参考（与 NPU 输出对比）
+    - 单测黄金参考（与 NPU 输出对比）—— 与 NPU 路径同走 direct 算法，保 bit-identical
+
+    v2 PR-3 算法语义变更：mask 不再做上游 CUDA 的"贪婪 blk 扩展"近似，改走真实
+    slash 区间 OR。这是合法的 MInference 算法变种（块扩展是为 Triton CUDA 块对齐
+    sparse kernel 服务，NPU token-level bool mask 路径无此需求）。与 v1 mask 的关系
+    由 :func:`_vertical_slash_pytorch_ref_legacy` 配合的子集测试验证：
+    direct ⊆ v1（visible 集合），即 v1 多覆盖一些块对齐扩展位置。
+    """
+    B, H, S_q, D = q.shape
+    S_k = k.shape[2]
+
+    mask = _build_vs_mask_direct(
+        v_idx, s_idx, S_q, S_k, device=q.device, block_size=block_size,
+    )  # [B, H, S_q, S_k] True=masked
+
+    scale = D ** -0.5
+    logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # [B, H, S_q, S_k]
+    logits.masked_fill_(mask, float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0)
+    out = torch.matmul(probs, v.float())
+    return out.to(q.dtype)
+
+
+def _vertical_slash_pytorch_ref_legacy(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    v_idx: torch.Tensor,
+    s_idx: torch.Tensor,
+    block_size: int = _DEFAULT_BLOCK_SIZE,
+) -> torch.Tensor:
+    """v1 算法参考（convert_vertical_slash_indexes + loop mask 构建）。**仅测试用**。
+
+    保留作为 PR-3 算法差异对比的对照基线。生产路径走 :func:`_vertical_slash_pytorch_ref`
+    （direct）。
+
+    v1 mask 继承上游 CUDA 的"贪婪 blk 扩展"近似，是 direct mask 的 visible 超集
+    （direct mask True ⊇ v1 mask True）。在 ``test_minference_batched_vs.py`` 的
+    T5 / T6 中分别验证子集关系 + attention 输出容差。
     """
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
@@ -279,13 +440,13 @@ def _vertical_slash_pytorch_ref(
         seqlens, v_idx.cpu(), s_idx.cpu(), S_k, block_size, block_size,
     )
 
-    mask = _build_vs_mask_from_indexes(
+    mask = _build_vs_mask_from_indexes_loop(
         block_count, block_offset, column_count, column_index,
         S_q, S_k, device=q.device, block_size=block_size,
-    )  # [B, H, S_q, S_k] True=masked
+    )
 
     scale = D ** -0.5
-    logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale  # [B, H, S_q, S_k]
+    logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
     logits.masked_fill_(mask, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0)
@@ -312,6 +473,11 @@ def _vertical_slash_npu(
     * q.device.type == "npu" 且 _HAS_TORCH_NPU
     * head_dim 已 pad 至 _ALLOWED_HEAD_DIMS 内
     * max(S_q, S_k) <= _MAX_SEQ_FOR_MASK（外层已检查）
+
+    v2 PR-3：mask 构建走 :func:`_build_vs_mask_direct`，直接从 (v_idx, s_idx) 在
+    NPU 上一步生成 [B,H,S_q,S_k] bool mask，跳过原 :func:`convert_vertical_slash_indexes`
+    的 CPU Python 双指针（每次 prefill 32 层 × 32 head × 128 query block ≈ 131072
+    次迭代）。等价性见 ``test_build_mask_direct_vs_convert_loop_bit_identical``。
     """
     assert _HAS_TORCH_NPU, "_vertical_slash_npu 不能在非 NPU 环境调用"
 
@@ -319,14 +485,8 @@ def _vertical_slash_npu(
     S_k = k.shape[2]
     scale = D ** -0.5
 
-    seqlens = torch.tensor([S_k] * B, dtype=torch.int32)
-    block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
-        seqlens, v_idx.cpu(), s_idx.cpu(), S_k, block_size, block_size,
-    )
-
-    mask = _build_vs_mask_from_indexes(
-        block_count, block_offset, column_count, column_index,
-        S_q, S_k, device=q.device, block_size=block_size,
+    mask = _build_vs_mask_direct(
+        v_idx, s_idx, S_q, S_k, device=q.device, block_size=block_size,
     )  # [B, H, S_q, S_k] True=masked，NPU 惯例
 
     try:

@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-25 — **v2 启动，分支 B 确认**。CANN 8.2.RC1 + torch/torch_npu 2.6.0 已升级完，全套 M1~M5 单测在新环境零回归（93 passed），但 `sparse_mode=2/4` 复测**仍未修复**（详见 §9.1 / §9.3 实测表），v2 走分支 B：O(S²) mask 留着，焦点收敛到消除 per-head Python 循环。
+> 最近更新：2026-05-26 — **PR-3 代码落地**。`_build_vs_mask_direct` 在 NPU 上一步从 (v_idx, s_idx) 构建 mask，完全跳过 `convert_vertical_slash_indexes` 双指针。整条 vertical-slash 路径里**最后一处 host-bound Python 循环已消除**。算法变种说明：direct mask 与 v1 不 bit-identical（v1 继承上游 CUDA 块对齐扩展近似，direct 用真实区间更精确），direct 是 v1 visible 子集，CPU 全套 16/16 PASS。待 NPU 实测回填性能表（详见 §12.4）。
 > 工作目录：`D:\tempt\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -329,7 +329,39 @@ M5 不引入新代码，只做实机验证：
 
 PR-1 / PR-2 完成后，热点链条已经从「外层 per-head 循环 → mask 构建三重循环」清空到「`convert_vertical_slash_indexes` 双指针」这唯一一处，定位明确。
 
-### 12.4 待解决
+### 12.4 PR-3：消除 convert_vertical_slash_indexes（2026-05-26 完成，代码已落地，待 NPU 实测）
 
-- [ ] **PR-3（TODO）**：消除 `convert_vertical_slash_indexes` 的 host-bound CPU Python 双指针路径 —— 具体方案待评审，**记录方案前先在 NPU 上量一发 `--attn-type dense` 8K 基线确认天花板**
-- [ ] 待 PR-3 完成后，更新本节性能表 + 决定是否进入 P1（长上下文 16K 内存 / 序列并行）或 P2（stream_llm / block_sparse 也 batch 化）
+**目标**：消除整条 v2 路径里**最后一处** host-bound CPU Python 循环 —— `convert_vertical_slash_indexes` 双指针每次 prefill ~131072 次迭代。
+
+**实现**：`ops/vertical_slash_kernel_npu.py` 新增 `_build_vs_mask_direct(v_idx, s_idx, S_q, S_k, device, block_size)`，从 (v_idx, s_idx) 在 NPU 上一步生成 `[B,H,S_q,S_k]` bool mask，**完全跳过 convert**：
+- Slash：对每个 (b,h,bq,k_s) 算 `range_end = max(end_m - s_raw, blk)`，invalid 位 sentinel 到 `S_k`，cumsum +1/-1 区间标记
+- Vertical：v_idx scatter 一次得 `[B,H,S_k]`，broadcast 到所有 bq；因果 mask 兜底处理 `j >= end_m`
+- `_vertical_slash_npu` 改走 direct（生产路径）
+- `_vertical_slash_pytorch_ref` 也切到 direct（NPU 黄金参考）
+- 保留 `_vertical_slash_pytorch_ref_legacy`（convert + loop，仅 T5/T6 对照用）
+
+**算法差异（已确认非 bug）**：direct mask 与 v1 mask **非 bit-identical**。
+- 上游 CUDA `vertical_slash_index.cu:69-72` 用**贪婪 blk 扩展**：相邻 slash 段让 `range_end += BLOCK_SIZE_M`（而非 `= new_range_end`），覆盖范围按 blk 累加。这是为 **Triton CUDA 块对齐 sparse kernel** 服务的近似。
+- NPU 路径 A 用 token-level bool mask 喂 `npu_fusion_attention(sparse_mode=1)`，**无块对齐需求**，direct 用真实 slash 区间 OR 更精确、更稀疏。
+- 关系：**direct True 集合 ⊇ v1 True 集合**（v1 多覆盖块对齐扩展位置；direct 可见 ⊆ v1 可见）。这是合法的 MInference 算法变种，**不破坏算法正确性**。
+- 用户 2026-05-26 拍板：方案 B（用真实区间，放弃 bit-identical）。
+
+**测试**（`tests/test_minference_batched_vs.py`，CPU 全套 16/16 PASS）：
+- T1/T2/T3：batched 等价（_pytorch_ref 同走 direct，仍 bit-identical 闭环）
+- T4：loop vs vec mask 构建（PR-2 遗留，与 PR-3 无关）
+- **T5（新）**：direct mask True ⊇ v1 mask True 子集关系（7 组参数，验证安全约束）
+- **T6（新）**：mask 一致行 attention 输出 bit-identical（隔离差异来源 —— S=512/384 case 下 mask 完全一致 max_abs=0，S=256 case 392/512 一致行内 bit-close，证明差异仅来自 v1 块对齐扩展，不是实现 bug）
+
+**修改文件清单**：
+- `minference/ops/vertical_slash_kernel_npu.py`（新增 `_build_vs_mask_direct` + `_vertical_slash_pytorch_ref_legacy`；`_vertical_slash_npu` / `_pytorch_ref` 切到 direct）
+- `tests/test_minference_batched_vs.py`（新增 T5/T6 + __main__ 入口更新）
+
+**待用户做的事**：
+- [ ] 在 NPU 服务器（env `flexhead`）跑 `pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py` 确认零回归（理论上 93 passed → 93+ passed，T5/T6 新增）
+- [ ] 跑 `examples/run_hf_minimal.py --attn_type minference` 8K 测一发实际 prefill 用时；预计 host-bound 进一步降低至秒级（因为整条 vs 路径已无 Python 循环）
+- [ ] 跑 8K dense 基线（之前 §12.3 §12.4 提到）确认天花板
+- [ ] 实测数据回填本节性能表 + 决定下一步（P1 长上下文 / P2 stream_llm/block_sparse batch 化）
+
+### 12.5 待解决
+
+- [ ] PR-3 实测验证（见 §12.4）；性能表回填后决定下一轮优化方向
