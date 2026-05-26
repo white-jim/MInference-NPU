@@ -24,7 +24,11 @@
 
 from __future__ import annotations
 
+import importlib.util as _ilu
 import math
+import os
+import sys
+import types
 import pytest
 import torch
 
@@ -32,15 +36,37 @@ import torch
 # 导入被测模块（streaming_kernel_npu 的内部函数 + 顶层接口）
 # ---------------------------------------------------------------------------
 
-from minference.ops.streaming_kernel_npu import (  # type: ignore[import]
-    _streaming_pytorch_ref,
-    streaming_forward,
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+pkg = types.ModuleType("minference")
+pkg.__path__ = [os.path.join(_REPO_ROOT, "minference")]
+sys.modules.setdefault("minference", pkg)
+ops_pkg = types.ModuleType("minference.ops")
+ops_pkg.__path__ = [os.path.join(_REPO_ROOT, "minference", "ops")]
+sys.modules.setdefault("minference.ops", ops_pkg)
+
+
+def _load_module(module_name: str, relative_path: str):
+    path = os.path.join(_REPO_ROOT, *relative_path.split("/"))
+    spec = _ilu.spec_from_file_location(module_name, path)
+    module = _ilu.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+streaming_kernel_npu = _load_module(
+    "minference.ops.streaming_kernel_npu",
+    "minference/ops/streaming_kernel_npu.py",
 )
 
+_streaming_pytorch_ref = streaming_kernel_npu._streaming_pytorch_ref
+streaming_forward = streaming_kernel_npu.streaming_forward
+
 try:
-    from minference.ops.streaming_kernel_npu import _streaming_npu  # type: ignore[import]
     import torch_npu  # type: ignore[import-not-found]  # noqa: F401
 
+    _streaming_npu = streaming_kernel_npu._streaming_npu
     _HAS_NPU = True
 except ImportError:
     _HAS_NPU = False

@@ -32,6 +32,9 @@ Triton kernel，见 ``docs/M3_block_sparse.md §6``）。
 from __future__ import annotations
 
 import math
+import importlib.util as _importlib_util
+import os
+import sys
 import warnings
 from typing import Optional
 
@@ -48,6 +51,9 @@ except ImportError:  # pragma: no cover
 
 
 __all__ = ["block_sparse_attention"]
+
+
+_SIBLING_MODULE_CACHE: dict[str, object] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +271,82 @@ def _block_sparse_npu(
     return result[0] if isinstance(result, (tuple, list)) else result
 
 
+def _load_sibling_module(module_name: str, filename: str):
+    cached = _SIBLING_MODULE_CACHE.get(filename)
+    if cached is not None:
+        return cached
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+        _SIBLING_MODULE_CACHE[filename] = module
+        return module
+    path = os.path.join(os.path.dirname(__file__), filename)
+    spec = _importlib_util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {filename} from {path}")
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    _SIBLING_MODULE_CACHE[filename] = module
+    return module
+
+
+def _block_sparse_tilelang_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Path B: TileLang true sparse attention for production per-head ``H==1`` calls."""
+    if q.dtype != torch.float16:
+        raise NotImplementedError("TileLang block-sparse MVP only supports fp16")
+    if q.shape[1] != 1:
+        raise NotImplementedError("TileLang block-sparse MVP is currently only wired for H==1")
+    if k.shape[1] != 1 or v.shape[1] != 1:
+        raise NotImplementedError("TileLang block-sparse MVP expects repeated per-head K/V")
+
+    B, H, S_q, D = q.shape
+    S_k = k.shape[2]
+
+    tilelang_indices = _load_sibling_module(
+        "tilelang_indices_block_sparse_standalone",
+        "tilelang_indices.py",
+    )
+    tilelang_sparse_attention = _load_sibling_module(
+        "tilelang_sparse_attention_block_sparse_standalone",
+        "tilelang_sparse_attention.py",
+    )
+
+    block_indices = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
+    indices = tilelang_indices.block_indices_to_tilelang(
+        block_indices,
+        S_q=S_q,
+        block_size_M=block_size,
+        block_size_N=block_size,
+        kv_heads=H,
+    )
+    indices = torch.where(
+        (indices >= 0) & (indices < S_k),
+        indices,
+        torch.full_like(indices, tilelang_indices.TILELANG_PAD_VALUE),
+    ).to(device=q.device, dtype=torch.int32)
+
+    kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
+        heads=H,
+        dim=D,
+        topk=indices.shape[-1],
+        kv_group=1,
+        block_I=block_size,
+        q_start_index_s=S_k - S_q,
+    )
+
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bsgd = k.transpose(1, 2).contiguous()
+    v_bsgd = v.transpose(1, 2).contiguous()
+    out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
+    return out_bshd.transpose(1, 2).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # 顶层入口
 # ---------------------------------------------------------------------------
@@ -320,22 +402,41 @@ def block_sparse_attention(
 
     S = max(q.shape[2], k.shape[2])
 
-    # 超长序列退化为 dense
-    if S > _MAX_SEQ_FOR_MASK:
-        warnings.warn(
-            f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
-            " bool mask 构建需 O(S²) 内存，退化为 causal dense。"
-            " 超长序列请改用 TileLang-Ascend 路径（docs/M3_block_sparse.md §6）。",
-            stacklevel=2,
-        )
-        from ..backend_npu import dense_attention
-
-        out = dense_attention(q, k, v, causal=True)
-        return out[..., :orig_head_d]
-
     # 主路径
     if q.device.type == "npu" and _HAS_TORCH_NPU:
-        out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
+        if q.shape[1] == 1 and q.dtype == torch.float16:
+            try:
+                out = _block_sparse_tilelang_npu(q, k, v, topk_blocks, block_size)
+            except ImportError as exc:
+                warnings.warn(
+                    "block_sparse_attention: TileLang path B is unavailable "
+                    f"({exc}); falling back to path A bool-mask attention.",
+                    stacklevel=2,
+                )
+                if S > _MAX_SEQ_FOR_MASK:
+                    warnings.warn(
+                        f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
+                        " bool mask 构建需 O(S²) 内存，退化为 causal dense。",
+                        stacklevel=2,
+                    )
+                    from ..backend_npu import dense_attention
+
+                    out = dense_attention(q, k, v, causal=True)
+                else:
+                    out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
+        else:
+            if S > _MAX_SEQ_FOR_MASK:
+                warnings.warn(
+                    f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
+                    " bool mask 构建需 O(S²) 内存，退化为 causal dense。"
+                    " 当前 TileLang path-B 仅接入 H==1 fp16 per-head 形态。",
+                    stacklevel=2,
+                )
+                from ..backend_npu import dense_attention
+
+                out = dense_attention(q, k, v, causal=True)
+            else:
+                out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
     else:
         out = _block_sparse_pytorch_ref(q, k, v, topk_blocks, block_size)
 

@@ -104,17 +104,69 @@ MInference 标准语义：
 |---|---|---|
 | one-block | 每行只看 K block 0 | PASS，`max_abs_diff=9.7656e-04` |
 | two-block | indices 包含未来 block，kernel causal mask 裁未来 token | PASS，`max_abs_diff=9.7656e-04` |
+| h1-one-block | production per-head 形态，`H==1` 小 head padding | PASS，`max_abs_diff=9.7656e-04` |
 | stream-llm | `stream_llm_to_tilelang(q_start_index_s=384)` 尾部窗口，无 pad | PASS，`max_abs_diff=4.8828e-04` |
 | stream-llm-pad | full-prefill 早期 token，`-1` pad 槽原生跳过 | PASS，`pad_count=6112`, `max_abs_diff=9.7656e-04` |
+| h1-stream-llm-pad | production per-head A-shape，`H==1` + `-1` pad | PASS，`max_abs_diff=9.7656e-04` |
 
 两个实现细节：
 
 - TileLang 的 `T.prim_func` 不能放在启用了 `from __future__ import annotations` 的文件里，否则 `T.Tensor(...)` 注解会被延迟成字符串并触发 TVMScript parser 错误。
 - 本 kernel builder 调用 `tilelang.disable_cache()`。调试过程中同名 JIT factory 的失败版本会污染动态 shape 绑定，表现为 `KeyError: 'Unfounded symbolic var: batch'`。
-- 接入 `block_sparse_attention` 顶层时发现生产调度当前按 head 单独调用，即 `H==1`。现有 TileLang kernel 通过 `vid` 把 head 维二分，`H_per_block // 2` 在 `H==1` 时变成 0，JIT 会报 `Invalid reduce output shape ... [0, 64]`。因此正式接入前需要先补 H==1 专用路径，或把 block-sparse 调度改成可共享 indices 的 batched 形态。
+- `build_sparse_attention_qkv_fwd` 现在有进程内 callable cache，key 为 `(heads, dim, topk, kv_group, sm_scale, causal, block_I, q_start, dtype, core_num)`。否则 benchmark 会反复把 TileLang JIT 编译时间算进每次 forward。
+- `H==1` 已按官方小 H padding 思路修复：`head_kv` pad 到至少 16，`kv_group==1` 下多出来的 head 由 TileLang 边界处理忽略，避免 `H_per_block // 2 == 0`。
+- `block_sparse_attention` 的生产 per-head 入口已接入 TileLang 路径：`H==1 + fp16 + NPU` 时从 `_select_block_sparse_topk_indices` 构造 TileLang token indices，超出 `S_k` 的 padding token 改成 `-1`，再调用 separate-Q/K/V kernel。实机 smoke：`tilelang_entry max_abs_diff=9.7656e-04, mean_abs_diff=2.5847e-05`。
+- `streaming_forward` 的生产 per-head 入口已接入 TileLang 路径：`H==1 + fp16 + NPU` 且 `(n_init,n_local)` 64 对齐时用 `stream_llm_to_tilelang(q_start_index_s=S_k-S_q)` 生成 A-shape indices。实机 smoke：`tilelang_stream_entry max_abs_diff=9.7656e-04, mean_abs_diff=2.9009e-05`。
+- 保留旧 path-A 作为非 MVP 兜底：`H!=1`、非 fp16、非 NPU、TileLang 未安装、或 A-shape 参数未 64 对齐时仍走原 `npu_fusion_attention + bool mask` / PyTorch reference；TileLang 编译/运行错误不吞掉，继续显式暴露。
 
-## 7. 下一步
+## 7. 速度 / 显存 benchmark
 
-1. 先解决 production `block_sparse` 的 `H==1` 接入问题：补 TileLang H==1 kernel，或把当前 per-head 调度改成可共享 indices 的 batched 调度。
-2. 接入 `stream_llm` / A-shape 路径，使用 `stream_llm_to_tilelang(q_start_index_s=...)`，不再依赖 `sanitize_indices_for_tilelang_kernel`。
-3. 再评估是否把 `kv_group==1` 扩展到 per-head / per-group K/V。
+新增脚本：`benchmarks/bench_tilelang_long_context.py`。
+
+用途：
+
+- 直接 standalone 加载 op 文件，避免 `flexhead-tl` 缺 transformers 时触发顶层 `minference` import。
+- 记录 first-call/JIT 时间、steady-state 平均耗时、tokens/s、path-B 命中次数、NPU peak allocated/reserved。
+- 当前 benchmark 只测 production per-head 形态：`B=1, H=1, D=64, fp16, topk_tokens=1024`。
+- **重要限制**：这里的显存是 synthetic kernel micro-benchmark 的 allocator 峰值，只包含单个 `H==1` q/k/v 输入和该 op 的临时张量 / workspace；不包含模型权重、全层 KV cache、完整多 head 调度、runtime 常驻 reserve、allocator 碎片或 HF/transformers 端到端开销。因此表里的 MB 只能作为该 kernel benchmark 的局部指标，不能解释为“长文本模型推理总显存”。
+
+实测环境：NPU 服务器 `flexhead-tl`，CANN 8.5.0，`PYTHONPATH=~/tilelang-ascend`。命令：
+
+```bash
+source ~/ascend/cann/8.5.0/cann-8.5.0/set_env.sh
+PYTHONPATH=~/tilelang-ascend conda run -n flexhead-tl python benchmarks/bench_tilelang_long_context.py \
+  --seq-lens 4096 8192 16384 \
+  --iters 3 --warmup 1 \
+  --modes block_sparse stream_llm \
+  --json-output benchmarks/results/tilelang_long_context_short.json
+```
+
+短 / 中长度结果：
+
+| mode | S | topk tokens | first call ms | mean ms | tokens/s | path-B hits | synthetic peak alloc MB | synthetic peak reserved MB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| block_sparse | 4K | 1024 | 15956.03 | 73.36 | 55832.2 | 1/3 | 58.0 | 90.0 |
+| stream_llm | 4K | 1024 | 14610.46 | 93.64 | 43740.4 | 1/3 | 19.1 | 22.0 |
+| block_sparse | 8K | 1024 | 148.09 | 145.06 | 56474.2 | 1/3 | 118.0 | 140.0 |
+| stream_llm | 8K | 1024 | 205.45 | 163.42 | 50127.4 | 1/3 | 38.6 | 56.0 |
+| block_sparse | 16K | 1024 | 297.02 | 290.57 | 56385.0 | 1/3 | 232.0 | 366.0 |
+| stream_llm | 16K | 1024 | 379.14 | 315.72 | 51893.3 | 1/3 | 74.6 | 88.0 |
+| block_sparse | 32K | 1024 | 16475.43 | 577.69 | 56722.6 | 1/3 | 464.1 | 686.0 |
+| stream_llm | 32K | 1024 | 15201.17 | 611.84 | 53556.6 | 1/3 | 148.6 | 172.0 |
+| block_sparse | 64K | 1024 | 1158.71 | 1160.34 | 56480.0 | 1/3 | 928.1 | 1344.0 |
+| stream_llm | 64K | 1024 | 1304.80 | 1226.30 | 53442.2 | 1/3 | 296.6 | 318.0 |
+
+观察：
+
+- 4K 的 first-call 包含 TileLang 编译，约 14-16s；steady-state 需看 `mean_ms`。
+- 32K 那轮在新进程重新编译，因此 first-call 再次约 15-16s；64K 已复用同进程 cache。
+- 4K 到 64K steady-state 基本线性，tokens/s 稳在约 53K-56K。
+- synthetic kernel 显存随 S 近似线性增长；这只能说明 path-B op 层面符合 `O(S * topk)` 预期，不再是 path-A bool mask 的 `O(S^2)`。
+- 当前还只是 `H==1` per-head 生产形态。完整模型若仍逐 head 调用，会把这个耗时乘上 head/layer 调度次数；模型运行时还会有权重、KV cache、框架常驻内存等额外占用。下一步重点仍是 batched/shared-index 调度或 HF 小规模 smoke 来定位端到端瓶颈。
+
+## 8. 下一步
+
+1. 先补 8K/16K/32K 的端到端 HF smoke，确认真实 `best_pattern` forward 会命中 TileLang path-B，并量化 per-head 调度开销。
+2. 评估是否把 block-sparse / stream-llm 从 per-head 调度升级成 batched/shared-index 调度，减少 kernel launch 次数。
+3. 继续按台阶测更长上下文：短长度稳定后先 128K，再 256K；记录速度、显存和是否 fallback。
+4. 再评估是否把 `kv_group==1` 扩展到 per-head / per-group K/V。

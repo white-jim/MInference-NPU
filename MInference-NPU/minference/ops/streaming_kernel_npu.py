@@ -42,6 +42,10 @@ sliding mask）。两条路径接口签名一致，测试用 PyTorch ref 做对�
 from __future__ import annotations
 
 import math
+import importlib.util as _importlib_util
+import os
+import sys
+import warnings
 from typing import Optional
 
 import torch
@@ -58,6 +62,9 @@ except ImportError:  # pragma: no cover — 非 NPU 环境
 __all__ = ["streaming_forward"]
 
 
+_SIBLING_MODULE_CACHE: dict[str, object] = {}
+
+
 # ----------------------------------------------------------------------------
 # head_dim 对齐（与上游一致）
 # ----------------------------------------------------------------------------
@@ -65,6 +72,26 @@ __all__ = ["streaming_forward"]
 # `npu_fusion_attention` 与上游 Triton kernel 都要求 head_dim ∈ {16,32,64,128,256,512}。
 # 其他取值需要 pad 到 2 的幂；推理完成后再截回原始 head_dim。
 _ALLOWED_HEAD_DIMS = (16, 32, 64, 128, 256, 512)
+_TILELANG_BLOCK_SIZE = 64
+
+
+def _load_sibling_module(module_name: str, filename: str):
+    cached = _SIBLING_MODULE_CACHE.get(filename)
+    if cached is not None:
+        return cached
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+        _SIBLING_MODULE_CACHE[filename] = module
+        return module
+    path = os.path.join(os.path.dirname(__file__), filename)
+    spec = _importlib_util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {filename} from {path}")
+    module = _importlib_util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    _SIBLING_MODULE_CACHE[filename] = module
+    return module
 
 
 def _pad_head_dim_to_pow2(t: torch.Tensor, target_d: int) -> torch.Tensor:
@@ -330,6 +357,70 @@ def _streaming_npu(
     return out_combined.to(q.dtype)
 
 
+def _streaming_tilelang_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    n_init: int,
+    n_local: int,
+) -> torch.Tensor:
+    """Path B: TileLang true sparse A-shape attention for per-head ``H==1`` calls."""
+    if q.dtype != torch.float16:
+        raise NotImplementedError("TileLang streaming MVP only supports fp16")
+    if q.shape[1] != 1:
+        raise NotImplementedError("TileLang streaming MVP is currently only wired for H==1")
+    if k.shape[1] != 1 or v.shape[1] != 1:
+        raise NotImplementedError("TileLang streaming MVP expects repeated per-head K/V")
+    if int(n_init) % _TILELANG_BLOCK_SIZE != 0 or int(n_local) % _TILELANG_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"n_init={n_init} and n_local={n_local} must be multiples of {_TILELANG_BLOCK_SIZE}"
+        )
+
+    B, H, S_q, D = q.shape
+    S_k = k.shape[2]
+    q_start = S_k - S_q
+
+    tilelang_indices = _load_sibling_module(
+        "tilelang_indices_streaming_standalone",
+        "tilelang_indices.py",
+    )
+    tilelang_sparse_attention = _load_sibling_module(
+        "tilelang_sparse_attention_streaming_standalone",
+        "tilelang_sparse_attention.py",
+    )
+
+    indices = tilelang_indices.stream_llm_to_tilelang(
+        B=B,
+        S_q=S_q,
+        kv_heads=H,
+        n_init=int(n_init),
+        n_local=int(n_local),
+        block_size_N=_TILELANG_BLOCK_SIZE,
+        q_start_index_s=q_start,
+        device="cpu",
+    )
+    indices = torch.where(
+        (indices >= 0) & (indices < S_k),
+        indices,
+        torch.full_like(indices, tilelang_indices.TILELANG_PAD_VALUE),
+    ).to(device=q.device, dtype=torch.int32)
+
+    kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
+        heads=H,
+        dim=D,
+        topk=indices.shape[-1],
+        kv_group=1,
+        block_I=_TILELANG_BLOCK_SIZE,
+        q_start_index_s=q_start,
+    )
+
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bsgd = k.transpose(1, 2).contiguous()
+    v_bsgd = v.transpose(1, 2).contiguous()
+    out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
+    return out_bshd.transpose(1, 2).contiguous()
+
+
 # ----------------------------------------------------------------------------
 # 顶层入口
 # ----------------------------------------------------------------------------
@@ -382,9 +473,27 @@ def streaming_forward(
         out = dense_attention(q, k, v, causal=True)
         return out[..., :orig_head_d]
 
-    # 主路径：NPU 上走两段 + LSE 合并；其他设备走 PyTorch 黄金参考
+    # 主路径：PR-4 H==1 fp16 走 TileLang 真稀疏；其他 NPU 场景保留 path-A 两段合并。
     if q.device.type == "npu" and _HAS_TORCH_NPU:
-        out = _streaming_npu(q, k, v, int(n_init), int(n_local))
+        if q.shape[1] == 1 and q.dtype == torch.float16:
+            try:
+                out = _streaming_tilelang_npu(q, k, v, int(n_init), int(n_local))
+            except ImportError as exc:
+                warnings.warn(
+                    "streaming_forward: TileLang path B is unavailable "
+                    f"({exc}); falling back to path A bool-mask attention.",
+                    stacklevel=2,
+                )
+                out = _streaming_npu(q, k, v, int(n_init), int(n_local))
+            except ValueError as exc:
+                warnings.warn(
+                    "streaming_forward: TileLang path B is not applicable "
+                    f"({exc}); falling back to path A bool-mask attention.",
+                    stacklevel=2,
+                )
+                out = _streaming_npu(q, k, v, int(n_init), int(n_local))
+        else:
+            out = _streaming_npu(q, k, v, int(n_init), int(n_local))
     else:
         out = _streaming_pytorch_ref(q, k, v, int(n_init), int(n_local))
 

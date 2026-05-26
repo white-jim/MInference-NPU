@@ -68,9 +68,9 @@ def _device() -> torch.device:
     return torch.device("npu:0")
 
 
-def _make_qkv(device: torch.device, s_q: int = S_Q, s_k: int = S_K):
+def _make_qkv(device: torch.device, s_q: int = S_Q, s_k: int = S_K, heads: int = H):
     torch.manual_seed(123)
-    q = torch.randn(B, s_q, H, D, dtype=torch.float16, device=device)
+    q = torch.randn(B, s_q, heads, D, dtype=torch.float16, device=device)
     k = torch.randn(B, s_k, KV_GROUP, D, dtype=torch.float16, device=device)
     v = torch.randn(B, s_k, KV_GROUP, D, dtype=torch.float16, device=device)
     return q, k, v
@@ -104,12 +104,12 @@ def _compare(name: str, out_tl: torch.Tensor, out_ref: torch.Tensor, threshold: 
     return ok
 
 
-def run_case(name: str, max_blocks: int, device: torch.device) -> bool:
+def run_case(name: str, max_blocks: int, device: torch.device, heads: int = H) -> bool:
     print("\n" + "=" * 60)
     print(f"[case] {name}")
     print("=" * 60)
 
-    q, k, v = _make_qkv(device)
+    q, k, v = _make_qkv(device, heads=heads)
     indices = block_indices_to_tilelang(
         _make_block_indices(max_blocks),
         S_q=S_Q,
@@ -124,7 +124,7 @@ def run_case(name: str, max_blocks: int, device: torch.device) -> bool:
     )
 
     kernel = build_sparse_attention_qkv_fwd(
-        heads=H,
+        heads=heads,
         dim=D,
         topk=topk,
         kv_group=KV_GROUP,
@@ -199,14 +199,13 @@ def run_stream_llm_case(device: torch.device) -> bool:
     return _compare(name, out_tl, out_ref)
 
 
-def run_stream_llm_pad_case(device: torch.device) -> bool:
-    name = "stream-llm-pad"
+def run_stream_llm_pad_case(device: torch.device, heads: int = H, name: str = "stream-llm-pad") -> bool:
     print("\n" + "=" * 60)
     print(f"[case] {name}")
     print("=" * 60)
 
     q_start = 0
-    q, k, v = _make_qkv(device, s_q=S_Q, s_k=S_Q)
+    q, k, v = _make_qkv(device, s_q=S_Q, s_k=S_Q, heads=heads)
     indices = stream_llm_to_tilelang(
         B=B,
         S_q=S_Q,
@@ -225,7 +224,7 @@ def run_stream_llm_pad_case(device: torch.device) -> bool:
     )
 
     kernel = build_sparse_attention_qkv_fwd(
-        heads=H,
+        heads=heads,
         dim=D,
         topk=topk,
         kv_group=KV_GROUP,
@@ -254,7 +253,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="TileLang separate-Q/K/V sparse attention smoke")
     parser.add_argument(
         "--case",
-        choices=["one-block", "two-block", "stream-llm", "stream-llm-pad", "all"],
+        choices=[
+            "one-block",
+            "two-block",
+            "h1-one-block",
+            "stream-llm",
+            "stream-llm-pad",
+            "h1-stream-llm-pad",
+            "all",
+        ],
         default="all",
     )
     args = parser.parse_args()
@@ -271,10 +278,16 @@ def main() -> int:
         results["one-block"] = run_case("one-block", max_blocks=1, device=device)
     if args.case in ("two-block", "all"):
         results["two-block"] = run_case("two-block", max_blocks=2, device=device)
+    if args.case in ("h1-one-block", "all"):
+        results["h1-one-block"] = run_case("h1-one-block", max_blocks=1, device=device, heads=1)
     if args.case in ("stream-llm", "all"):
         results["stream-llm"] = run_stream_llm_case(device)
     if args.case in ("stream-llm-pad", "all"):
         results["stream-llm-pad"] = run_stream_llm_pad_case(device)
+    if args.case in ("h1-stream-llm-pad", "all"):
+        results["h1-stream-llm-pad"] = run_stream_llm_pad_case(
+            device, heads=1, name="h1-stream-llm-pad"
+        )
 
     print("\n" + "=" * 60)
     print("[summary]")

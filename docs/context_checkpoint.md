@@ -1,8 +1,9 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-26 — **路径 A 弃用，v2 转向 triton-ascend / tilelang-ascend 真稀疏 FA（PR-4）**。PR-3 把 8K prefill 拉到 7.28s（vs dense 1.95s，3.73×），但 16K 实测 21.95s vs dense 4.68s（4.69×，差距扩大不收敛），且 O(S²) bool mask 在 128K 必 OOM —— **路径 A 是死胡同**。用户升级到 CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0，并在 `flexhead-tl` 中跑通 tilelang 官方 `sparse_attention_fwd` 三个闸门 case：sanity / block-sparse / stream-llm 均 PASS（详见 §13.7）。当前仅需继续 A-shape 与 block-sparse 两种模式；剩余关键适配问题是 pad 不容错、`kv_group==1` 限制、标准 K/V 分离到官方 packed KV 语义的映射。
+> 最近更新：2026-05-26 — **路径 A 弃用，v2 转向 triton-ascend / tilelang-ascend 真稀疏 FA（PR-4）**。PR-3 把 8K prefill 拉到 7.28s（vs dense 1.95s，3.73×），但 16K 实测 21.95s vs dense 4.68s（4.69×，差距扩大不收敛），且 O(S²) bool mask 在 128K 必 OOM —— **路径 A 是死胡同**。用户升级到 CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0，并在 `flexhead-tl` 中跑通 tilelang 官方 `sparse_attention_fwd` 三个闸门 case：sanity / block-sparse / stream-llm 均 PASS（详见 §13.7）。当前仅需继续 A-shape 与 block-sparse 两种模式；separate-Q/K/V TileLang kernel 已支持 native `-1` pad skip，production `block_sparse` 和 `stream_llm` 的 per-head `H==1` TileLang 真稀疏入口均已接入并通过实机验证。已开始速度/显存 benchmark：`H==1, D=64, topk_tokens=1024` 下 4K→64K steady-state 线性，64K 为 block_sparse 1160.34ms / synthetic kernel peak 928.1MB，stream_llm 1226.30ms / synthetic kernel peak 296.6MB。**注意：这些 MB 是 isolated synthetic kernel 的局部指标，不是端到端模型总显存，不包含模型权重（通常十几 GB 起）、KV cache、HF/transformers 常驻张量和 runtime reserve。**下一步先做 HF 小规模端到端 smoke，再评估 batched/shared-index 调度并按台阶推进 128K / 256K+。
 > 工作目录：`D:\tempt\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
+> 服务器工作目录：`/data/guoshiyao/zhw/MInference-NPU/MInference-NPU`；服务器运行环境与命令见 `MInference-NPU/docs/SERVER_ENV.md`。
 
 ---
 
@@ -542,4 +543,11 @@ NPU 对应方案：**triton-ascend**（华为开源 Triton for Ascend）。
 - [x] separate-Q/K/V kernel 已实现 native `-1` pad skip：pad 槽不载入 K/V，logits 侧与 causal mask 合并屏蔽；新增 `stream-llm-pad` full-prefill 早期 token case，`pad_count=6112`，PASS，`max_abs_diff=9.7656e-04`。
 - [x] `tests/test_block_sparse_kernel.py` 改为 standalone 加载，避免 `flexhead-tl` 无 `transformers` 时 collection 失败；`pytest tests/test_block_sparse_kernel.py -q` 在真实 NPU 权限下 29 passed。
 - [x] 评估 `block_sparse_attention` 顶层接入：生产调度当前 per-head 调用导致 `H==1`，而现有 TileLang kernel 的 head 二分实现会令 `v_block=H_per_block//2=0`，JIT 报 `Invalid reduce output shape ... [0, 64]`。因此没有把失败快路径留在生产入口。
-- [ ] 下一步：先补 TileLang sparse attention 的 H==1 专用路径，或把 `block_sparse` 从 per-head 调度改成可共享 indices 的 batched 调度；随后接 `stream_llm` / A-shape 路径；再评估是否把 `kv_group==1` 扩到 per-head / per-group K/V。
+- [x] 补 TileLang sparse attention 的 `H==1` 支持：参考官方小 H padding 思路，把 `head_kv` pad 到至少 16，避免 `v_block=0`；新增 `h1-one-block` case，PASS，`max_abs_diff=9.7656e-04`。
+- [x] `block_sparse_attention` 生产入口接入 TileLang 真稀疏 per-head 路径：`H==1 + fp16 + NPU` 时构造 token-level TileLang indices，越界/pad 槽置 `-1`，调用 separate-Q/K/V kernel；实机 smoke `tilelang_entry max_abs_diff=9.7656e-04, mean_abs_diff=2.5847e-05`。
+- [x] `streaming_forward` / A-shape 生产入口接入 TileLang 真稀疏 per-head 路径：`H==1 + fp16 + NPU` 且 `(n_init,n_local)` 64 对齐时使用 `stream_llm_to_tilelang(q_start_index_s=S_k-S_q)` 生成 indices；TileLang 未安装或参数未对齐时回退 path-A。
+- [x] 回归验证：`PYTHONPATH=~/tilelang-ascend conda run -n flexhead-tl python tests/test_tilelang_sparse_attention.py --case all` 六个 case 全 PASS；`python -m pytest tests/test_block_sparse_kernel.py -q` 29 passed；`python -m pytest tests/test_streaming_kernel.py -q` 32 passed。
+- [x] 新增 `benchmarks/bench_tilelang_long_context.py`：standalone 加载 op，记录 first-call/JIT、steady-state ms、tokens/s、path-B hit count、peak allocated/reserved。
+- [x] 短 / 中长度速度显存已测，全部 path-B 命中：16K block_sparse 290.57ms / synthetic kernel peak 232.0MB，stream_llm 315.72ms / synthetic kernel peak 74.6MB；64K block_sparse 1160.34ms / synthetic kernel peak 928.1MB，stream_llm 1226.30ms / synthetic kernel peak 296.6MB。结果写入 `MInference-NPU/docs/PR4_tilelang_adaptation.md §7`，JSON 在 `benchmarks/results/`。
+- [x] 已记录显存口径修正：`bench_tilelang_long_context.py` 只是 isolated synthetic kernel micro-benchmark；表里的 MB 是该 kernel benchmark 的局部 allocator peak，不包含模型权重、完整 KV cache、HF/transformers 常驻内存或 runtime reserve，不能解释为长文本模型推理总显存。
+- [ ] 下一步：先做 8K/16K/32K HF 小规模端到端 smoke，确认真实 best_pattern forward 能命中 TileLang path-B，并量化 per-head 调度开销；然后评估 batched/shared-index 调度；短/中长度稳定后再推进 128K / 256K+。

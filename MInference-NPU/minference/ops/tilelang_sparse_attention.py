@@ -20,8 +20,17 @@ import torch
 
 __all__ = [
     "build_sparse_attention_qkv_fwd",
+    "clear_sparse_attention_qkv_kernel_cache",
     "sparse_attention_qkv_reference",
 ]
+
+
+_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def clear_sparse_attention_qkv_kernel_cache() -> None:
+    """Clear compiled TileLang sparse-attention callables cached by this module."""
+    _KERNEL_CACHE.clear()
 
 
 def _require_tilelang():
@@ -53,8 +62,6 @@ def build_sparse_attention_qkv_fwd(
     ``heads``, ``dim`` and ``topk`` are compile-time constants.
     """
 
-    tilelang, DataType, T = _require_tilelang()
-
     if kv_group != 1:
         raise NotImplementedError("PR-4 MVP only supports kv_group == 1")
     if not is_causal:
@@ -69,6 +76,25 @@ def build_sparse_attention_qkv_fwd(
         raise NotImplementedError("PR-4 MVP only supports dtype='float16'")
     if pad_value != -1:
         raise NotImplementedError("PR-4 MVP only supports pad_value == -1")
+
+    cache_key = (
+        heads,
+        dim,
+        topk,
+        kv_group,
+        sm_scale,
+        is_causal,
+        block_I,
+        q_start_index_s,
+        pad_value,
+        dtype,
+        core_num,
+    )
+    cached = _KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    tilelang, DataType, T = _require_tilelang()
 
     pass_configs = {
         tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
@@ -108,13 +134,17 @@ def build_sparse_attention_qkv_fwd(
         NI = tilelang.cdiv(topk, block_I)
         D = dim
 
+        padded_head_kv = max(tilelang.math.next_power_of_2(head_kv), 16)
+        if padded_head_kv != head_kv and kv_group != 1:
+            raise AssertionError("automatic small-H padding is only supported for kv_group == 1")
+
         if head_kv > 64:
             assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
             REPLICATE_H = head_kv // 64
         else:
             REPLICATE_H = 1
 
-        H_per_block = head_kv if REPLICATE_H == 1 else 64
+        H_per_block = padded_head_kv if REPLICATE_H == 1 else 64
         v_block = H_per_block // 2
         ub_len = max(32 // (DataType(accum_dtype).bits // 8), v_block)
 
@@ -171,16 +201,12 @@ def build_sparse_attention_qkv_fwd(
                         h_i = bx % REPLICATE_H
 
                         heads_per_group = heads // kv_group
-                        group_start = g_i * heads_per_group
-                        group_end = (g_i + 1) * heads_per_group
-                        H0 = group_start
-                        H1 = group_end
+                        H0 = g_i * padded_head_kv
+                        H1 = H0 + H_per_block
 
                         if REPLICATE_H != 1:
-                            blocks_in_group = tilelang.cdiv(heads_per_group, H_per_block)
-                            block_idx_in_group = bx % blocks_in_group
-                            H0 = group_start + block_idx_in_group * H_per_block
-                            H1 = T.if_then_else(H0 + H_per_block > group_end, group_end, H0 + H_per_block)
+                            H0 = g_i * heads_per_group + (bx % REPLICATE_H) * H_per_block
+                            H1 = H0 + H_per_block
 
                         with T.Scope("C"):
                             T.copy(Q[b_i, s_i, H0:H1, :D], q_l1)
@@ -339,7 +365,7 @@ def build_sparse_attention_qkv_fwd(
 
         return main
 
-    return _kernel_factory(
+    kernel = _kernel_factory(
         heads=heads,
         dim=dim,
         topk=topk,
@@ -350,6 +376,8 @@ def build_sparse_attention_qkv_fwd(
         pad_value=pad_value,
         core_num=core_num,
     )
+    _KERNEL_CACHE[cache_key] = kernel
+    return kernel
 
 
 def sparse_attention_qkv_reference(
