@@ -30,9 +30,16 @@ import argparse
 import importlib
 import inspect
 import math
+import os
 import sys
 import traceback
 from typing import Callable, Optional
+
+# 自洽：把 MInference-NPU 仓库根（tests/ 的父目录）加进 sys.path，
+# 这样无论从哪里调用脚本都能 import minference.*
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import torch
 
