@@ -17,6 +17,8 @@
     * 调用：``func(q, kv, indices)`` 三参数。output 和 5 个 workspace 由
             ``@tilelang.jit(out_idx=[3], workspace_idx=[4..8])`` 自动分配
     * sm_scale 默认 = ``(dim + tail_dim) ** -0.5``（不是 dim ** -0.5）
+    * 当前官方 example 源码断言 ``kv_group == 1``。因此本闸门先验证 4 个 Q heads
+      共享一组 KV/Indices 的路径；per-head MHA/GQA 映射留到 PR-4-tl-BS kernel 适配。
 
 PR-4-tl-sfa 闸门策略：
     测试就用 NSA 风格输入（dim + tail_dim packed KV），不试图把 standard MInference
@@ -246,7 +248,7 @@ def _compare(name: str, out_tl: torch.Tensor, out_ref: torch.Tensor, threshold: 
 B = 1
 S = 512          # S_q = S_k
 H = 4            # Q heads
-KV_GROUP = 4     # MHA: g = H 等价于"每个 Q head 独立 KV head"，h_index = H // g = 1
+KV_GROUP = 1     # 官方 example 当前 assert kv_group == 1；4 个 Q heads 共享同一 KV/Indices
 DIM = 128        # V 的维度 == output 维度
 TAIL_DIM = 64    # K 额外段（NSA 设计；最小满足 kernel 编译）
 BLOCK_I = 64
