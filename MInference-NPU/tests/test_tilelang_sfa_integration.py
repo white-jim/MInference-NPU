@@ -250,10 +250,11 @@ S = 512          # S_q = S_k
 H = 4            # Q heads
 KV_GROUP = 1     # 官方 example 当前 assert kv_group == 1；4 个 Q heads 共享同一 KV/Indices
 DIM = 128        # V 的维度 == output 维度
-TAIL_DIM = 64    # K 额外段（NSA 设计；最小满足 kernel 编译）
+TAIL_DIM = 128   # 已知 tilelang example 在 heads=4 时可编译的组合：Q/KV last dim = 256
 BLOCK_I = 64
 KV_STRIDE = 1
 Q_START = 0
+TOPK = 256       # 已知可编译；且给 early tokens 留足 pad sentinel 槽位
 
 
 def _make_qkv(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -275,7 +276,7 @@ def run_sanity_case(sfa: Callable, device: torch.device) -> bool:
     print("=" * 60)
 
     q, kv = _make_qkv(device)
-    topk = 128  # 2 个 K blocks，必须 % BLOCK_I == 0
+    topk = TOPK  # 必须 % BLOCK_I == 0
 
     # 与 example 同样的初始化方式：先全部填 S（作 pad sentinel），再随机选 valid
     indices = torch.full((B, S, KV_GROUP, topk), S, dtype=torch.int32)
@@ -316,10 +317,10 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     block_size_M = BLOCK_I
     block_size_N = BLOCK_I
     n_q_blocks = S // block_size_M
-    max_blocks = 2  # 每个 Q block 看 2 个 K block → topk = 2*64 = 128
+    max_blocks = TOPK // block_size_N
 
-    # 每个 (b, h, q_block) 选 K block（含 anchor 0 和 sliding 当前块）。
-    # q_blk=0 时二者重叠，用 block_count 把第二段置 pad，避免 kernel 重复计算同一段 K。
+    # 每个 (b, h, q_block) 选 K block（anchor + trailing window）。
+    # 用 block_count 屏蔽重复/越界槽位，避免 kernel 重复计算同一段 K。
     block_indices = torch.zeros(
         B, KV_GROUP, n_q_blocks, max_blocks, dtype=torch.int32
     )
@@ -327,11 +328,14 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     for b in range(B):
         for h in range(KV_GROUP):
             for q_blk in range(n_q_blocks):
-                block_indices[b, h, q_blk] = torch.tensor(
-                    [0, q_blk], dtype=torch.int32
+                choices = [0]
+                for k_blk in range(max(0, q_blk - max_blocks + 2), q_blk + 1):
+                    if k_blk not in choices:
+                        choices.append(k_blk)
+                block_indices[b, h, q_blk, : len(choices)] = torch.tensor(
+                    choices, dtype=torch.int32
                 )
-                if q_blk == 0:
-                    block_count[b, h, q_blk] = 1
+                block_count[b, h, q_blk] = len(choices)
 
     indices = block_indices_to_tilelang(
         block_indices,
@@ -368,7 +372,7 @@ def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     print("=" * 60)
 
     q, kv = _make_qkv(device)
-    n_init, n_local = 64, 64  # topk = 128
+    n_init, n_local = 64, TOPK - 64
 
     indices = stream_llm_to_tilelang(
         B=B, S_q=S, kv_heads=KV_GROUP,
