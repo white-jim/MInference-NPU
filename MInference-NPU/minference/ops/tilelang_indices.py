@@ -19,11 +19,11 @@ tilelang ``sparse_attention_fwd`` 接受的 ``Indices`` 张量约定：
         给定 (n_init, n_local)，按 anchor + sliding-window 直接构造，无须先打分。
 
 GQA 注意事项：
-  tilelang Indices 的第 3 维是 ``kv_group``，表示**一个 KV head 服务多少个 Q head**
-  时 Q heads 在分组维度上的索引。在 MHA（``H == n_kv_heads``）时 ``kv_group = 1``，
-  Indices 第 3 维 ``= n_kv_heads = H``，每个 Q head 拥有独立索引列表。
+  tilelang Indices 的第 3 维是 ``kv_group``，也就是 KV tensor 的第 3 维 ``g``：
+  ``[B, S_k, g, D]``。一个 KV head 服务 ``H // g`` 个 Q head。在 MHA
+  （``H == n_kv_heads``）时 ``kv_group = H``，每个 Q head 拥有独立索引列表。
 
-  在真 GQA（``H = 32`` 个 Q head 共享 ``n_kv_heads = 8`` 个 KV head，``kv_group = 4``）
+  在真 GQA（``H = 32`` 个 Q head 共享 ``n_kv_heads = 8`` 个 KV head，``kv_group = 8``）
   时，同一 KV head 下的 4 个 Q head **必须**共享同一 Indices 行。MInference 上游
   对 GQA 通常采用 "Q head 内部各自打分但 KV 只算一份" 的实现，无法直接映射。
 
@@ -147,9 +147,9 @@ def stream_llm_to_tilelang(
       - **Anchor**：token ``[0, n_init)`` （所有 Q 共享）
       - **Local**：token ``[s_q - n_local + 1, s_q]`` （滑窗，越界部分填 pad_value）
 
-    若 Anchor 与 Local 在小 ``s_q`` 时重叠，token 位置会重复出现 —— tilelang kernel 对
-    重复 K 位置应当容错（会算两次相同 K，结果不影响正确性，只是稍微浪费 FLOPs）；
-    若实测发现性能/精度问题再加 dedupe 逻辑。
+    Anchor 与 Local 重叠的位置会在 Local 段填 ``pad_value``，避免同一个 K token
+    被 sparse kernel 重复计入 softmax。Reference 的 scatter mask 会天然去重，但
+    真正的 sparse kernel 通常按 Indices 列表逐项计算，重复项会改变概率分布。
 
     Args:
         B, S_q, kv_heads: 输出 Indices 形状的前三维。
@@ -175,9 +175,10 @@ def stream_llm_to_tilelang(
     s_q_idx = torch.arange(S_q, device=device, dtype=dtype).reshape(1, S_q, 1, 1)
     local_off = torch.arange(-n_local + 1, 1, device=device, dtype=dtype).reshape(1, 1, 1, n_local)
     local_pos = s_q_idx + local_off  # [1, S_q, 1, n_local]
-    # 越过序列起点（< 0）的位置填 pad_value
+    # 越过序列起点（< 0）或与 anchor 重叠的位置填 pad_value，保持 Indices 唯一。
+    # anchor 本身始终保留；未来位置由 kernel 的 causal 逻辑屏蔽。
     local_pos = torch.where(
-        local_pos >= 0,
+        (local_pos >= 0) & (local_pos >= n_init),
         local_pos,
         torch.full_like(local_pos, pad_value),
     )

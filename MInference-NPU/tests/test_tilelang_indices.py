@@ -178,24 +178,30 @@ class TestStreamLlmToTilelang:
         assert torch.equal(out[0, s_q, 0, n_init:], expected_local)
 
     def test_local_sliding_window_edge(self):
-        """s_q < n_local-1 时滑窗起点为负 → 填 pad_value。"""
+        """s_q < n_local-1 或 local 与 anchor 重叠时 → local 段填 pad_value。"""
         B, S_q, kv_heads = 1, 64, 1
         n_init, n_local = 64, 64
         out = stream_llm_to_tilelang(B, S_q, kv_heads, n_init, n_local, block_size_N=64)
-        # s_q = 0：local 段应是 [-63..-1, 0]，前 63 个填 pad，最后一个是 0
+        # s_q = 0：local 段原本是 [-63..-1, 0]，0 已在 anchor 里，因此全填 pad。
         s_q = 0
         local = out[0, s_q, 0, n_init:]
-        assert (local[:n_local - 1] == TILELANG_PAD_VALUE).all()
-        assert local[-1].item() == 0
+        assert (local == TILELANG_PAD_VALUE).all()
 
-        # s_q = 10：local 段应是 [-53..-1, 0..10]，前 53 个填 pad，后 11 个是 [0..10]
+        # s_q = 10：local 段原本是 [-53..-1, 0..10]，0..10 都已在 anchor 里。
         s_q = 10
         local = out[0, s_q, 0, n_init:]
-        assert (local[: n_local - s_q - 1] == TILELANG_PAD_VALUE).all()
-        assert torch.equal(
-            local[n_local - s_q - 1 :],
-            torch.arange(0, s_q + 1, dtype=torch.int32),
-        )
+        assert (local == TILELANG_PAD_VALUE).all()
+
+    def test_local_anchor_overlap_is_padded(self):
+        """Local 段和 anchor 重叠的 token 置 pad，避免 sparse kernel 重复计数。"""
+        B, S_q, kv_heads = 1, 128, 1
+        n_init, n_local = 64, 64
+        out = stream_llm_to_tilelang(B, S_q, kv_heads, n_init, n_local, block_size_N=64)
+
+        s_q = 64
+        local = out[0, s_q, 0, n_init:]
+        assert (local[: n_local - 1] == TILELANG_PAD_VALUE).all()
+        assert local[-1].item() == 64
 
     def test_topk_divisible_validation(self):
         with pytest.raises(ValueError, match="block_size_N"):
