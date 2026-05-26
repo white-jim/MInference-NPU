@@ -178,6 +178,45 @@ def _torch_sparse_ref(
 # ---------------------------------------------------------------------------
 
 
+def _build_kernel(
+    sfa: Callable,
+    heads: int,
+    dim: int,
+    topk: int,
+    is_causal: bool,
+    block_I: int,
+) -> object:
+    """sparse_attention_fwd 是 kernel 构造器，返回 compiled kernel。"""
+    return sfa(
+        heads=heads,
+        dim=dim,
+        tail_dim=dim,
+        topk=topk,
+        kv_stride=1,
+        kv_group=1,
+        sm_scale=1.0 / math.sqrt(dim),
+        is_causal=is_causal,
+        block_I=block_I,
+    )
+
+
+def _inspect_kernel(kernel: object) -> None:
+    """打印 kernel 的关键属性，帮助确定调用顺序。"""
+    print(f"[adapter] kernel type: {type(kernel).__name__}")
+    interesting_attrs = ["params", "input_tensors", "buffer_map", "prim_func", "func"]
+    for attr in interesting_attrs:
+        if hasattr(kernel, attr):
+            val = getattr(kernel, attr)
+            print(f"[adapter] kernel.{attr} = {val!r}")
+    # 如果有 torch_function，看它的 signature
+    if hasattr(kernel, "torch_function"):
+        try:
+            sig = inspect.signature(kernel.torch_function)
+            print(f"[adapter] kernel.torch_function signature: {sig}")
+        except (TypeError, ValueError):
+            pass
+
+
 def _call_sparse_attention_fwd(
     sfa: Callable,
     q: torch.Tensor,
@@ -186,43 +225,22 @@ def _call_sparse_attention_fwd(
     indices: torch.Tensor,
     is_causal: bool,
     block_I: int,
+    arg_order: str = "qkvi",
 ) -> torch.Tensor:
-    """调用 tilelang sparse_attention_fwd。
+    """构造 kernel 并按 ``arg_order`` 指定的顺序调用。
 
-    我们不确定它是：
-      (a) 直接 sfa(Q, K, V, Indices) 形式
-      (b) sfa(heads, dim, ...) 返回 compiled function，再 compiled(Q, K, V, Indices)
-    所以先尝试 (a)，失败再 (b)。
+    arg_order 是 4 字符串，每个字符是 q/k/v/i 之一，例如 ``"qkvi"`` = ``kernel(q, k, v, indices)``。
     """
-    B, H, S_q, D = q.shape
-    S_k = k.shape[2]
+    B, H, _, D = q.shape
     topk = indices.shape[-1]
+    kernel = _build_kernel(sfa, H, D, topk, is_causal, block_I)
+    _inspect_kernel(kernel)
 
-    # 尝试 (a)
-    try:
-        return sfa(q, k, v, indices)
-    except TypeError as e_a:
-        print(f"[adapter] 直接调用失败（尝试 b 路径）：{e_a}")
-
-    # 尝试 (b)：先构造 kernel，再调用
-    try:
-        kernel = sfa(
-            heads=H,
-            dim=D,
-            tail_dim=D,
-            topk=topk,
-            kv_stride=1,
-            kv_group=1,
-            sm_scale=1.0 / math.sqrt(D),
-            is_causal=is_causal,
-            block_I=block_I,
-        )
-        return kernel(q, k, v, indices)
-    except Exception as e_b:
-        raise RuntimeError(
-            f"两种调用方式都失败。最后一次错误：{e_b}\n"
-            "请把 --probe 输出的 signature 报回来，我修适配器。"
-        ) from e_b
+    tensor_map = {"q": q, "k": k, "v": v, "i": indices}
+    args = [tensor_map[c] for c in arg_order]
+    print(f"[adapter] calling kernel({', '.join(arg_order)}) with shapes "
+          f"{[tuple(t.shape) for t in args]} dtypes {[str(t.dtype) for t in args]}")
+    return kernel(*args)
 
 
 # ---------------------------------------------------------------------------
