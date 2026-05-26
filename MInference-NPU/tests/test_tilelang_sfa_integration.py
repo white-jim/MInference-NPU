@@ -63,6 +63,7 @@ tilelang_indices = _ilu.module_from_spec(_ti_spec)
 _ti_spec.loader.exec_module(tilelang_indices)
 TILELANG_PAD_VALUE = tilelang_indices.TILELANG_PAD_VALUE
 block_indices_to_tilelang = tilelang_indices.block_indices_to_tilelang
+sanitize_indices_for_tilelang_kernel = tilelang_indices.sanitize_indices_for_tilelang_kernel
 stream_llm_to_tilelang = tilelang_indices.stream_llm_to_tilelang
 
 __test__ = False  # 不让 pytest 当 collection target
@@ -374,14 +375,22 @@ def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     print("=" * 60)
 
     q, kv = _make_qkv(device)
-    n_init, n_local = 256, 0
+    n_init, n_local = 64, 192
 
-    # 当前 tilelang kernel 不容忍 pad sentinel。用 full anchor 填满 topk，先验证
-    # stream_llm_to_tilelang 生成的 A-shape anchor 段能和 kernel/reference 对齐。
+    # 当前 tilelang kernel 不容忍 pad sentinel；sanitize 会把 pad 替换成
+    # 合法但被 causal mask 屏蔽的未来 token。本尾部窗口 case 正常不会产生 pad，
+    # 但这里仍走一遍适配层，保持与生产调用一致。
     indices = stream_llm_to_tilelang(
         B=B, S_q=S_Q, kv_heads=KV_GROUP,
         n_init=n_init, n_local=n_local, block_size_N=BLOCK_I,
+        q_start_index_s=Q_START,
         device="cpu",
+    )
+    indices = sanitize_indices_for_tilelang_kernel(
+        indices,
+        S_k=S_K,
+        q_start_index_s=Q_START,
+        kv_stride=KV_STRIDE,
     ).to(device)
     topk = indices.shape[-1]
     _print_case_tensors("sl", q, kv, indices)

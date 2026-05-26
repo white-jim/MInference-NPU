@@ -12,14 +12,48 @@
 
 from __future__ import annotations
 
+import importlib.util as _ilu
+import os
+
 import pytest
 import torch
 
-from minference.ops.tilelang_indices import (
-    TILELANG_PAD_VALUE,
-    block_indices_to_tilelang,
-    stream_llm_to_tilelang,
-)
+# Standalone-load the target module instead of importing ``minference.ops``.
+# ``minference/__init__.py`` eagerly imports transformers, while the lightweight
+# ``flexhead-tl`` env used for tilelang probing intentionally does not install it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TI_PATH = os.path.join(_REPO_ROOT, "minference", "ops", "tilelang_indices.py")
+_ti_spec = _ilu.spec_from_file_location("tilelang_indices_standalone", _TI_PATH)
+tilelang_indices = _ilu.module_from_spec(_ti_spec)
+assert _ti_spec.loader is not None
+_ti_spec.loader.exec_module(tilelang_indices)
+
+TILELANG_PAD_VALUE = tilelang_indices.TILELANG_PAD_VALUE
+block_indices_to_tilelang = tilelang_indices.block_indices_to_tilelang
+sanitize_indices_for_tilelang_kernel = tilelang_indices.sanitize_indices_for_tilelang_kernel
+stream_llm_to_tilelang = tilelang_indices.stream_llm_to_tilelang
+
+
+def _visible_from_indices(
+    indices: torch.Tensor,
+    S_k: int,
+    *,
+    q_start_index_s: int = 0,
+    kv_stride: int = 1,
+) -> torch.Tensor:
+    """Build the causal-visible set represented by Indices for CPU assertions."""
+    B, S_q, G, _ = indices.shape
+    visible = torch.zeros(B, S_q, G, S_k, dtype=torch.bool)
+    key_abs = torch.arange(kv_stride - 1, S_k * kv_stride, kv_stride)
+    for b in range(B):
+        for s in range(S_q):
+            q_abs = q_start_index_s + s
+            for g in range(G):
+                for raw in indices[b, s, g].tolist():
+                    idx = int(raw)
+                    if 0 <= idx < S_k and key_abs[idx].item() <= q_abs:
+                        visible[b, s, g, idx] = True
+    return visible
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +250,85 @@ class TestStreamLlmToTilelang:
         out = stream_llm_to_tilelang(B, S_q, kv_heads, n_init, n_local, block_size_N=64)
         for h in range(1, kv_heads):
             assert torch.equal(out[0, :, 0, :], out[0, :, h, :])
+
+    def test_q_start_offsets_local_window(self):
+        """尾部 Q 窗口时，local 段应按 K 序列绝对位置构造。"""
+        out = stream_llm_to_tilelang(
+            B=1,
+            S_q=4,
+            kv_heads=1,
+            n_init=0,
+            n_local=4,
+            block_size_N=4,
+            q_start_index_s=10,
+        )
+        assert torch.equal(out[0, 0, 0], torch.tensor([7, 8, 9, 10], dtype=torch.int32))
+        assert torch.equal(out[0, 3, 0], torch.tensor([10, 11, 12, 13], dtype=torch.int32))
+
+
+# ---------------------------------------------------------------------------
+# sanitize_indices_for_tilelang_kernel
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeIndicesForTilelangKernel:
+    def test_pad_slots_become_causally_masked_future_tokens(self):
+        indices = torch.tensor(
+            [[
+                [[0, TILELANG_PAD_VALUE, TILELANG_PAD_VALUE]],
+                [[0, 1, TILELANG_PAD_VALUE]],
+                [[0, 1, 2]],
+            ]],
+            dtype=torch.int32,
+        )
+        out = sanitize_indices_for_tilelang_kernel(indices, S_k=4, q_start_index_s=0)
+
+        assert out.dtype == torch.int32
+        assert (out >= 0).all()
+        assert (out < 4).all()
+        assert torch.equal(out[0, 0, 0], torch.tensor([0, 1, 1], dtype=torch.int32))
+        assert torch.equal(out[0, 1, 0], torch.tensor([0, 1, 2], dtype=torch.int32))
+        assert torch.equal(
+            _visible_from_indices(out, 4, q_start_index_s=0),
+            _visible_from_indices(indices, 4, q_start_index_s=0),
+        )
+
+    def test_default_q_start_matches_tail_window(self):
+        indices = torch.tensor(
+            [[
+                [[10, TILELANG_PAD_VALUE]],
+                [[11, TILELANG_PAD_VALUE]],
+            ]],
+            dtype=torch.int32,
+        )
+        # S_k - S_q = 14, so row 0 can use future token 15; row 1 has no future.
+        with pytest.raises(ValueError, match="没有可用的未来 K token"):
+            sanitize_indices_for_tilelang_kernel(indices, S_k=16)
+
+        indices[0, 1, 0, 1] = 15
+        out = sanitize_indices_for_tilelang_kernel(indices, S_k=16)
+        assert torch.equal(out[0, 0, 0], torch.tensor([10, 15], dtype=torch.int32))
+
+    def test_raises_when_pad_on_last_causal_row(self):
+        indices = torch.tensor([[[[0]], [[1]], [[TILELANG_PAD_VALUE]]]], dtype=torch.int32)
+        with pytest.raises(ValueError, match="没有可用的未来 K token"):
+            sanitize_indices_for_tilelang_kernel(indices, S_k=3, q_start_index_s=0)
+
+    def test_stream_llm_padding_sanitize_preserves_visible_set(self):
+        raw = stream_llm_to_tilelang(
+            B=1,
+            S_q=128,
+            kv_heads=1,
+            n_init=64,
+            n_local=64,
+            block_size_N=64,
+            q_start_index_s=0,
+        )
+        assert (raw == TILELANG_PAD_VALUE).any()
+        out = sanitize_indices_for_tilelang_kernel(raw, S_k=512, q_start_index_s=0)
+        assert (out >= 0).all()
+        assert (out < 512).all()
+        assert torch.equal(
+            _visible_from_indices(out, 512, q_start_index_s=0),
+            _visible_from_indices(raw, 512, q_start_index_s=0),
+        )

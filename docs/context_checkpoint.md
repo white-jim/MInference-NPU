@@ -529,6 +529,17 @@ NPU 对应方案：**triton-ascend**（华为开源 Triton for Ascend）。
 
 - [x] NPU 服务器 `flexhead-tl` 已可导入 tilelang-ascend 官方 SFA，官方 smoke test PASS。
 - [x] PR-4-tl-sfa 三个闸门 case（sanity / block-sparse / stream-llm）均 PASS。
-- [ ] 修 `tests/test_tilelang_indices.py` 在 `flexhead-tl` 无 transformers 环境下的 import 问题。
-- [ ] 继续 PR-4 适配设计：只覆盖 A-shape 和 block-sparse，先不做 vertical-slash。
-- [ ] 明确三项关键设计：pad 处理、`kv_group==1`/per-head pattern 处理、标准 K/V 到 packed KV 的处理。
+- [x] 修 `tests/test_tilelang_indices.py` 在 `flexhead-tl` 无 transformers 环境下的 import 问题。
+- [x] 继续 PR-4 适配设计：只覆盖 A-shape 和 block-sparse，先不做 vertical-slash。
+- [x] 明确三项关键设计：pad 处理、`kv_group==1`/per-head pattern 处理、标准 K/V 到 packed KV 的处理。
+- [x] `tilelang_indices.py` 新增 `stream_llm_to_tilelang(..., q_start_index_s=...)`，修正官方 SFA 尾部 Q 窗口语义。
+- [x] `tilelang_indices.py` 新增 `sanitize_indices_for_tilelang_kernel`：把 pad 槽替换成合法但会被 causal mask 屏蔽的未来 K token，避免官方 kernel 对 `-1`/`S_k` pad NaN。
+- [x] `docs/PR4_tilelang_adaptation.md` 固化适配设计：官方 packed-KV SFA 只作为接口/indices 闸门，生产 PR-4-BS/SL 需分离 `q,k,v` 的 tilelang kernel；MVP 暂定 `kv_group=1` 共享 pattern。
+- [x] 验证：`flexhead-tl` 下 `pytest tests/test_tilelang_indices.py -v` 18 passed；`PYTHONPATH=~/tilelang-ascend python tests/test_tilelang_sfa_integration.py --case all` 三个 case 全 PASS。
+- [x] 从 `block_sparse` 开始写分离 K/V 的 tilelang sparse attention MVP：新增 `minference/ops/tilelang_sparse_attention.py`，提供 `build_sparse_attention_qkv_fwd` + PyTorch reference；固定 `kv_group=1`、BSHD/BSGD、causal fp16、无 pad。
+- [x] 新增 `tests/test_tilelang_sparse_attention.py`，用 `block_indices_to_tilelang` 接入新 kernel；`one-block` 与 `two-block`（含未来 block，验证 kernel causal mask）均 PASS，`max_abs_diff=9.7656e-04`。
+- [x] 同一 separate-Q/K/V kernel 已接 `stream_llm_to_tilelang(q_start_index_s=...)` 尾部窗口 case（无 pad），PASS，`max_abs_diff=4.8828e-04`。
+- [x] separate-Q/K/V kernel 已实现 native `-1` pad skip：pad 槽不载入 K/V，logits 侧与 causal mask 合并屏蔽；新增 `stream-llm-pad` full-prefill 早期 token case，`pad_count=6112`，PASS，`max_abs_diff=9.7656e-04`。
+- [x] `tests/test_block_sparse_kernel.py` 改为 standalone 加载，避免 `flexhead-tl` 无 `transformers` 时 collection 失败；`pytest tests/test_block_sparse_kernel.py -q` 在真实 NPU 权限下 29 passed。
+- [x] 评估 `block_sparse_attention` 顶层接入：生产调度当前 per-head 调用导致 `H==1`，而现有 TileLang kernel 的 head 二分实现会令 `v_block=H_per_block//2=0`，JIT 报 `Invalid reduce output shape ... [0, 64]`。因此没有把失败快路径留在生产入口。
+- [ ] 下一步：先补 TileLang sparse attention 的 H==1 专用路径，或把 `block_sparse` 从 per-head 调度改成可共享 indices 的 batched 调度；随后接 `stream_llm` / A-shape 路径；再评估是否把 `kv_group==1` 扩到 per-head / per-group K/V。

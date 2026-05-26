@@ -26,21 +26,38 @@
 
 from __future__ import annotations
 
+import importlib.util as _ilu
 import math
+import os
 
 import pytest
 import torch
 
-from minference.ops.block_sparse_kernel_npu import (  # type: ignore[import]
-    _block_sparse_pytorch_ref,
-    _build_block_sparse_mask,
-    block_sparse_attention,
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_module(module_name: str, relative_path: str):
+    path = os.path.join(_REPO_ROOT, *relative_path.split("/"))
+    spec = _ilu.spec_from_file_location(module_name, path)
+    module = _ilu.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+block_sparse_kernel_npu = _load_module(
+    "block_sparse_kernel_npu_standalone",
+    "minference/ops/block_sparse_kernel_npu.py",
 )
 
+_block_sparse_pytorch_ref = block_sparse_kernel_npu._block_sparse_pytorch_ref
+_build_block_sparse_mask = block_sparse_kernel_npu._build_block_sparse_mask
+block_sparse_attention = block_sparse_kernel_npu.block_sparse_attention
+
 try:
-    from minference.ops.block_sparse_kernel_npu import _block_sparse_npu  # type: ignore[import]
     import torch_npu  # type: ignore[import-not-found]  # noqa: F401
 
+    _block_sparse_npu = block_sparse_kernel_npu._block_sparse_npu
     _HAS_NPU = True
 except ImportError:
     _HAS_NPU = False

@@ -91,6 +91,41 @@ def _pad_head_dim(t: torch.Tensor, target_d: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _select_block_sparse_topk_indices(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """返回每个 query block 选中的 K block 索引，形状 ``[B,H,n_bq,topk]``。"""
+    B, H, S_q, D = q.shape
+    S_k = k.shape[2]
+
+    pad_q = (-S_q) % block_size  # 0 if S_q % block_size == 0
+    pad_k = (-S_k) % block_size
+    S_q_p = S_q + pad_q
+    S_k_p = S_k + pad_k
+    n_bq = S_q_p // block_size
+    n_bk = S_k_p // block_size
+
+    q_p = F.pad(q, (0, 0, 0, pad_q)) if pad_q else q  # [B, H, S_q_p, D]
+    k_p = F.pad(k, (0, 0, 0, pad_k)) if pad_k else k  # [B, H, S_k_p, D]
+
+    q_pool = q_p.reshape(B, H, n_bq, block_size, D).mean(dim=3).float()  # [B, H, n_bq, D]
+    k_pool = k_p.reshape(B, H, n_bk, block_size, D).mean(dim=3).float()  # [B, H, n_bk, D]
+
+    scale = D ** -0.5
+    scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * scale  # [B, H, n_bq, n_bk]
+
+    bq_idx = torch.arange(n_bq, device=q.device)
+    bk_idx = torch.arange(n_bk, device=q.device)
+    causal_block = bq_idx[:, None] >= bk_idx[None, :]  # [n_bq, n_bk]
+    scores.masked_fill_(~causal_block[None, None], float("-inf"))
+
+    topk = min(topk_blocks, n_bk)
+    return torch.topk(scores, topk, dim=-1).indices  # [B, H, n_bq, topk]
+
+
 def _build_block_sparse_mask(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -113,8 +148,9 @@ def _build_block_sparse_mask(
     """
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
+    topk_idx = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
 
-    # --- 1. pad 到 block 边界 ---
+    # --- 1. 展开 block mask 到 token 级 [B, H, S_q_p, S_k_p] ---
     pad_q = (-S_q) % block_size  # 0 if S_q % block_size == 0
     pad_k = (-S_k) % block_size
     S_q_p = S_q + pad_q
@@ -122,30 +158,9 @@ def _build_block_sparse_mask(
     n_bq = S_q_p // block_size
     n_bk = S_k_p // block_size
 
-    q_p = F.pad(q, (0, 0, 0, pad_q)) if pad_q else q  # [B, H, S_q_p, D]
-    k_p = F.pad(k, (0, 0, 0, pad_k)) if pad_k else k  # [B, H, S_k_p, D]
-
-    # --- 2. block 级 mean-pool，fp32 计算防溢出 ---
-    q_pool = q_p.reshape(B, H, n_bq, block_size, D).mean(dim=3).float()  # [B, H, n_bq, D]
-    k_pool = k_p.reshape(B, H, n_bk, block_size, D).mean(dim=3).float()  # [B, H, n_bk, D]
-
-    scale = D ** -0.5
-    scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * scale  # [B, H, n_bq, n_bk]
-
-    # --- 3. 施加 block 级因果约束（bq >= bk） ---
-    bq_idx = torch.arange(n_bq, device=q.device)
-    bk_idx = torch.arange(n_bk, device=q.device)
-    causal_block = bq_idx[:, None] >= bk_idx[None, :]  # [n_bq, n_bk]
-    scores.masked_fill_(~causal_block[None, None], float("-inf"))
-
-    # --- 4. 每个 query block 选 top-k key blocks ---
-    topk = min(topk_blocks, n_bk)
-    topk_idx = torch.topk(scores, topk, dim=-1).indices  # [B, H, n_bq, topk]
-
     block_attend = torch.zeros(B, H, n_bq, n_bk, dtype=torch.bool, device=q.device)
     block_attend.scatter_(-1, topk_idx, True)
 
-    # --- 5. 展开 block mask 到 token 级 [B, H, S_q_p, S_k_p] ---
     # 数学验证：reshape 后 token[b,h,bq*bs+bqi, bk*bs+bki] = block_attend[b,h,bq,bk] ✓
     token_attend = (
         block_attend.unsqueeze(3).unsqueeze(5)            # [B, H, n_bq, 1, n_bk, 1]
@@ -154,7 +169,7 @@ def _build_block_sparse_mask(
     )
     token_attend = token_attend[:, :, :S_q, :S_k]  # trim padding
 
-    # --- 6. 追加 per-token 因果约束 ---
+    # --- 2. 追加 per-token 因果约束 ---
     # query token i 的绝对位置 = (S_k - S_q) + i；可见 key token j 满足 j <= abs_i
     abs_i = torch.arange(S_k - S_q, S_k, device=q.device)  # [S_q]
     j_idx = torch.arange(S_k, device=q.device)              # [S_k]

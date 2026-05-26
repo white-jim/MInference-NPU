@@ -40,6 +40,7 @@ import torch
 __all__ = [
     "block_indices_to_tilelang",
     "stream_llm_to_tilelang",
+    "sanitize_indices_for_tilelang_kernel",
     "TILELANG_PAD_VALUE",
 ]
 
@@ -137,15 +138,16 @@ def stream_llm_to_tilelang(
     n_init: int,
     n_local: int,
     block_size_N: int = 64,
+    q_start_index_s: int = 0,
     pad_value: int = TILELANG_PAD_VALUE,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.int32,
 ) -> torch.Tensor:
     """A-shape (stream_llm) 模式的 tilelang Indices 直接构造。
 
-    每个 Q token ``s_q`` 看到：
+    每个 Q token ``s_q``（绝对位置 ``q_start_index_s + s_q``）看到：
       - **Anchor**：token ``[0, n_init)`` （所有 Q 共享）
-      - **Local**：token ``[s_q - n_local + 1, s_q]`` （滑窗，越界部分填 pad_value）
+      - **Local**：token ``[q_abs - n_local + 1, q_abs]`` （滑窗，越界部分填 pad_value）
 
     Anchor 与 Local 重叠的位置会在 Local 段填 ``pad_value``，避免同一个 K token
     被 sparse kernel 重复计入 softmax。Reference 的 scatter mask 会天然去重，但
@@ -156,6 +158,8 @@ def stream_llm_to_tilelang(
         n_init: anchor token 数量（必须是 ``block_size_N`` 的倍数）。
         n_local: 滑窗长度（必须是 ``block_size_N`` 的倍数）。
         block_size_N: tilelang ``block_I``，验证 topk 整除用。
+        q_start_index_s: Q 窗口在 K 序列里的起始绝对位置。full prefill 时为 0；
+            官方 tilelang SFA example 的尾部窗口为 ``S_k * kv_stride - S_q``。
         pad_value: 越界 / 无效位置填充值。
         device, dtype: 输出张量配置。
 
@@ -171,8 +175,10 @@ def stream_llm_to_tilelang(
     # Anchor：[0, 1, ..., n_init-1]，所有 Q token 共享
     anchor = torch.arange(n_init, device=device, dtype=dtype).reshape(1, 1, 1, n_init)
 
-    # Local：第 s_q 个 Q token 的滑窗 = [s_q - n_local + 1, ..., s_q]
-    s_q_idx = torch.arange(S_q, device=device, dtype=dtype).reshape(1, S_q, 1, 1)
+    # Local：第 s_q 个 Q token 的滑窗 = [q_abs - n_local + 1, ..., q_abs]
+    s_q_idx = (
+        torch.arange(S_q, device=device, dtype=dtype) + int(q_start_index_s)
+    ).reshape(1, S_q, 1, 1)
     local_off = torch.arange(-n_local + 1, 1, device=device, dtype=dtype).reshape(1, 1, 1, n_local)
     local_pos = s_q_idx + local_off  # [1, S_q, 1, n_local]
     # 越过序列起点（< 0）或与 anchor 重叠的位置填 pad_value，保持 Indices 唯一。
@@ -186,3 +192,63 @@ def stream_llm_to_tilelang(
     anchor_full = anchor.expand(B, S_q, kv_heads, n_init).contiguous()
     local_full = local_pos.expand(B, S_q, kv_heads, n_local).contiguous()
     return torch.cat([anchor_full, local_full], dim=-1)
+
+
+def sanitize_indices_for_tilelang_kernel(
+    indices: torch.Tensor,
+    S_k: int,
+    *,
+    q_start_index_s: Optional[int] = None,
+    kv_stride: int = 1,
+    pad_value: int = TILELANG_PAD_VALUE,
+) -> torch.Tensor:
+    """把 pad 槽替换成合法且会被 causal mask 屏蔽的 K token。
+
+    现阶段官方 tilelang ``sparse_attention_fwd`` 对 pad sentinel 不容错：
+    ``-1`` / ``S_k`` 都可能触发越界载入或 NaN。为了在不修改 kernel 的前提下
+    表达“空槽”，本函数把每个 pad 槽替换成同一行 Q 的第一个未来 K token。
+    该 token 地址合法，但在 ``is_causal=True`` 下不可见，因此不改变有效 attention
+    集合。
+
+    若某行已经没有未来 K token（例如最后一个 query）但仍有 pad，本函数会抛
+    ``ValueError``。这表示当前 fixed-topk 官方 kernel 无法无损表达该行，需要：
+    1. 修改 kernel 原生跳过 pad；或
+    2. 调整上游 indices 构造，保证这些行没有 pad。
+    """
+    if indices.dim() != 4:
+        raise ValueError(f"indices 应为 [B,S_q,kv_group,topk]，得到 {tuple(indices.shape)}")
+    if S_k <= 0:
+        raise ValueError(f"S_k 必须为正数，得到 {S_k}")
+    if kv_stride <= 0:
+        raise ValueError(f"kv_stride 必须为正数，得到 {kv_stride}")
+
+    _, S_q, _, _ = indices.shape
+    if q_start_index_s is None:
+        q_start_index_s = S_k * kv_stride - S_q
+
+    device = indices.device
+    q_abs = (
+        torch.arange(S_q, device=device, dtype=torch.int64) + int(q_start_index_s)
+    )
+    # 官方 reference 的 K 绝对位置为 [kv_stride-1, 2*kv_stride-1, ...]。
+    first_future = torch.div(
+        q_abs - (kv_stride - 1),
+        kv_stride,
+        rounding_mode="floor",
+    ) + 1
+    first_future = first_future.clamp_min(0)
+    has_future = first_future < S_k
+
+    invalid = (indices == pad_value) | (indices < 0) | (indices >= S_k)
+    invalid_rows = invalid.any(dim=(0, 2, 3))
+    bad_rows = invalid_rows & ~has_future
+    if bool(bad_rows.any().item()):
+        first_bad = torch.nonzero(bad_rows, as_tuple=False).flatten()[:8].cpu().tolist()
+        raise ValueError(
+            "indices 含 pad/越界槽位，但这些 Q 行没有可用的未来 K token 可替换；"
+            f" rows={first_bad}, S_k={S_k}, q_start_index_s={q_start_index_s}, "
+            f"kv_stride={kv_stride}"
+        )
+
+    filler = first_future.to(indices.dtype).reshape(1, S_q, 1, 1)
+    return torch.where(invalid, filler, indices).contiguous().to(torch.int32)
