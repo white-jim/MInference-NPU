@@ -19,6 +19,8 @@
     * sm_scale 默认 = ``(dim + tail_dim) ** -0.5``（不是 dim ** -0.5）
     * 当前官方 example 源码断言 ``kv_group == 1``。因此本闸门先验证 4 个 Q heads
       共享一组 KV/Indices 的路径；per-head MHA/GQA 映射留到 PR-4-tl-BS kernel 适配。
+    * 当前官方 example 的小尺寸可编译闸门固定为 ``S_q=128, S_k=512``，
+      ``q_start_index_s = S_k - S_q``，即 Q 是 KV 尾部窗口。
 
 PR-4-tl-sfa 闸门策略：
     测试就用 NSA 风格输入（dim + tail_dim packed KV），不试图把 standard MInference
@@ -262,6 +264,13 @@ def _make_qkv(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     return q, kv
 
 
+def _print_case_tensors(name: str, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> None:
+    print(
+        f"[{name}] q={tuple(q.shape)} kv={tuple(kv.shape)} "
+        f"indices={tuple(indices.shape)} q_start={Q_START}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -281,12 +290,12 @@ def run_sanity_case(sfa: Callable, device: torch.device) -> bool:
     for b in range(B):
         for t in range(S_Q):
             for g in range(KV_GROUP):
-                # 因果：Q at position t 看 K 位置 [0, t]，topk 个候选
+                # 因果：Q token 的绝对位置是 Q_START + t；候选来自其历史 K。
                 max_valid = max(1, (t + Q_START) // KV_STRIDE)
                 k_pos = torch.randperm(max_valid)[:topk]
                 indices[b, t, g, : len(k_pos)] = k_pos.to(torch.int32)
     indices = indices.to(device)
-    print(f"[sanity] q={tuple(q.shape)} kv={tuple(kv.shape)} indices={tuple(indices.shape)}")
+    _print_case_tensors("sanity", q, kv, indices)
 
     kernel = _build_kernel(sfa, H, DIM, TAIL_DIM, topk, kv_group=KV_GROUP, block_I=BLOCK_I)
     try:
@@ -345,7 +354,8 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     )
     indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
     topk = indices.shape[-1]
-    print(f"[bs] indices shape={tuple(indices.shape)} topk={topk} pad→{S_K}")
+    _print_case_tensors("bs", q, kv, indices)
+    print(f"[bs] topk={topk} pad→{S_K}")
 
     kernel = _build_kernel(sfa, H, DIM, TAIL_DIM, topk, kv_group=KV_GROUP, block_I=BLOCK_I)
     try:
@@ -379,7 +389,8 @@ def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     )
     indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
     topk = indices.shape[-1]
-    print(f"[sl] indices shape={tuple(indices.shape)} topk={topk} pad→{S_K}")
+    _print_case_tensors("sl", q, kv, indices)
+    print(f"[sl] topk={topk} pad→{S_K}")
 
     kernel = _build_kernel(sfa, H, DIM, TAIL_DIM, topk, kv_group=KV_GROUP, block_I=BLOCK_I)
     try:
