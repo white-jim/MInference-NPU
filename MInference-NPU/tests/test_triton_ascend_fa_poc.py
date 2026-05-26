@@ -203,6 +203,78 @@ def _bench_one(fn, q, k, v, scale, warmup: int = 3, iters: int = 10) -> float:
     return (t1 - t0) / iters * 1000.0  # ms / iter
 
 
+def run_block_sweep(verbose: bool = False) -> None:
+    """8K dense causal 上的 (BLOCK_M, BLOCK_N) sweep — 找最优 tile。
+
+    诊断 PR-4-poc 首跑慢得离谱时（ratio > 50）用：BLOCK 大小是 triton-ascend 在 NPU
+    上最主要的旋钮，64×64 是 GPU 默认值但对 NPU AI Core 经常太小。
+    """
+    try:
+        from minference.ops.triton_ascend_fa_poc import (
+            has_triton,
+            triton_ascend_fa_dense,
+        )
+
+        if not has_triton():
+            print("[sweep] SKIP — triton-ascend 不可用")
+            return
+
+        dev = _require_npu(verbose)
+
+        B, N, S, D = 1, 4, 8192, 128
+        torch.manual_seed(0)
+        q = torch.randn(B, N, S, D, dtype=torch.float16, device=dev)
+        k = torch.randn(B, N, S, D, dtype=torch.float16, device=dev)
+        v = torch.randn(B, N, S, D, dtype=torch.float16, device=dev)
+        scale = 1.0 / math.sqrt(D)
+
+        # 先取 npu_fa baseline
+        try:
+            t_npu = _bench_one(_npu_fa_dense_causal, q, k, v, scale)
+        except Exception as e:  # noqa: BLE001
+            print(f"[sweep] npu_fa baseline FAIL: {e}")
+            return
+
+        block_pairs = [
+            (32, 32),
+            (64, 64),    # 默认
+            (64, 128),
+            (128, 64),
+            (128, 128),
+            (128, 256),
+            (256, 128),
+            (256, 256),
+        ]
+
+        print("-" * 72)
+        print(f"8K dense causal block sweep (npu_fa baseline = {t_npu:.2f} ms)")
+        print("-" * 72)
+        print(f"{'BLOCK_M':<10}{'BLOCK_N':<10}{'triton(ms)':<14}{'ratio':<10}{'note':<20}")
+        print("-" * 72)
+
+        for bm, bn in block_pairs:
+            def f(q, k, v, scale, _bm=bm, _bn=bn):
+                return triton_ascend_fa_dense(
+                    q, k, v, sm_scale=scale, causal=True,
+                    block_m=_bm, block_n=_bn,
+                )
+            try:
+                t = _bench_one(f, q, k, v, scale, warmup=2, iters=5)
+                ratio = t / t_npu
+                print(f"{bm:<10}{bn:<10}{t:<14.2f}{ratio:<10.2f}")
+            except Exception as e:  # noqa: BLE001
+                short = f"{e.__class__.__name__}: {str(e)[:60]}"
+                print(f"{bm:<10}{bn:<10}{'FAIL':<14}{'--':<10}{short:<20}")
+
+        print("-" * 72)
+        print("解读：找出 ratio 最小的 (BLOCK_M, BLOCK_N) — 多数 NPU FA kernel 实践")
+        print("      最优 tile 在 (128,64) / (128,128) / (256,128) 附近。")
+    except Exception as e:  # noqa: BLE001
+        print(f"[sweep] FATAL: {e.__class__.__name__}: {e}")
+        if verbose:
+            traceback.print_exc()
+
+
 def run_benchmark(verbose: bool = False) -> None:
     """8K / 16K dense causal benchmark — triton-ascend vs npu_fusion_attention。"""
     try:
@@ -275,7 +347,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="PR-4-poc：triton-ascend dense FA vs npu_fusion_attention")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--skip-bench", action="store_true", help="只跑精度，不跑 benchmark")
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="对 (BLOCK_M, BLOCK_N) 做 sweep（诊断 ratio 异常时用，跑完后退出）",
+    )
     args = parser.parse_args()
+
+    if args.sweep:
+        print("=" * 72)
+        print("PR-4-poc BLOCK sweep（诊断模式）")
+        print("=" * 72)
+        run_block_sweep(args.verbose)
+        return 0
 
     print("=" * 72)
     print("PR-4-poc：triton-ascend dense FA kernel 验收（精度 + 8K/16K 性能）")
