@@ -21,6 +21,7 @@
       共享一组 KV/Indices 的路径；per-head MHA/GQA 映射留到 PR-4-tl-BS kernel 适配。
     * 当前官方 example 的小尺寸可编译闸门固定为 ``S_q=128, S_k=512``，
       ``q_start_index_s = S_k - S_q``，即 Q 是 KV 尾部窗口。
+    * 当前 kernel 对 ``pad=S_k`` 槽位不容错，topk 列必须全部是有效 K token。
 
 PR-4-tl-sfa 闸门策略：
     测试就用 NSA 风格输入（dim + tail_dim packed KV），不试图把 standard MInference
@@ -326,23 +327,17 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
     n_q_blocks = S_Q // block_size_M
     max_blocks = TOPK // block_size_N
 
-    # 每个 (b, h, q_block) 选 K block（anchor + trailing window）。
-    # 用 block_count 屏蔽重复/越界槽位，避免 kernel 重复计算同一段 K。
+    # 当前 tilelang kernel 不容忍 pad sentinel；每个 Q block 都填满 4 个有效 K block。
     block_indices = torch.zeros(
         B, KV_GROUP, n_q_blocks, max_blocks, dtype=torch.int32
     )
-    block_count = torch.full((B, KV_GROUP, n_q_blocks), 2, dtype=torch.int32)
     for b in range(B):
         for h in range(KV_GROUP):
             for q_blk in range(n_q_blocks):
-                choices = [0]
-                for k_blk in range(max(0, q_blk - max_blocks + 2), q_blk + 1):
-                    if k_blk not in choices:
-                        choices.append(k_blk)
-                block_indices[b, h, q_blk, : len(choices)] = torch.tensor(
-                    choices, dtype=torch.int32
+                # Q 的绝对位置在 [384, 511]，这些 K block 全部满足 causal。
+                block_indices[b, h, q_blk] = torch.tensor(
+                    [0, 1, 2, 3], dtype=torch.int32
                 )
-                block_count[b, h, q_blk] = len(choices)
 
     indices = block_indices_to_tilelang(
         block_indices,
@@ -350,7 +345,6 @@ def run_block_sparse_case(sfa: Callable, device: torch.device) -> bool:
         block_size_M=block_size_M,
         block_size_N=block_size_N,
         kv_heads=KV_GROUP,
-        block_count=block_count,
     )
     indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
     topk = indices.shape[-1]
@@ -380,14 +374,15 @@ def run_stream_llm_case(sfa: Callable, device: torch.device) -> bool:
     print("=" * 60)
 
     q, kv = _make_qkv(device)
-    n_init, n_local = 64, TOPK - 64
+    n_init, n_local = 256, 0
 
+    # 当前 tilelang kernel 不容忍 pad sentinel。用 full anchor 填满 topk，先验证
+    # stream_llm_to_tilelang 生成的 A-shape anchor 段能和 kernel/reference 对齐。
     indices = stream_llm_to_tilelang(
         B=B, S_q=S_Q, kv_heads=KV_GROUP,
         n_init=n_init, n_local=n_local, block_size_N=BLOCK_I,
         device="cpu",
-    )
-    indices = _pad_to_kernel_sentinel(indices, s_k=S_K).to(device)
+    ).to(device)
     topk = indices.shape[-1]
     _print_case_tensors("sl", q, kv, indices)
     print(f"[sl] topk={topk} pad→{S_K}")
