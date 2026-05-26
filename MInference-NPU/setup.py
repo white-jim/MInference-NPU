@@ -29,7 +29,7 @@ setup(
         "minference.configs": ["*.json", "leank/*"],
     },
     install_requires=[
-        "torch>=2.5.1,<2.7",
+        "torch>=2.5.1,<2.8",
         # torch_npu / CANN 走昇腾官方渠道，版本需按实机 CANN 匹配。
         "transformers>=4.45",
         "accelerate>=0.28",
