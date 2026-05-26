@@ -26,9 +26,9 @@
 
 # Ascend NPU stack.
 # 这三行仅作版本声明，实际安装走上面的分步命令（专用 index）。
-torch==2.7.1+cpu
-torch-npu==2.7.1.post4
-triton-ascend==3.2.0
+# torch==2.7.1+cpu
+# torch-npu==2.7.1.post4
+# triton-ascend==3.2.0
 
 # Core runtime.
 # 4.57.3 / 0.34.2 是 v1/v2 路径 A 用过的稳定组合；CANN 升级后如有兼容问题再调
