@@ -146,10 +146,11 @@ def _ref_sparse_attention_fwd_interface(
     g_index = g
     h_index = h // g
 
+    ref_device = q.device
     compressed_casual_mask = torch.arange(
-        q_start_index_s, sq + q_start_index_s, dtype=torch.int32
+        q_start_index_s, sq + q_start_index_s, dtype=torch.int32, device=ref_device
     ).view(-1, 1) >= torch.arange(
-        kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32
+        kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32, device=ref_device
     ).view(1, -1)
 
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(
