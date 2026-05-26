@@ -1,12 +1,38 @@
 # Runtime and test dependencies for MInference-NPU.
 # Python 3.10 is the target environment for the Ascend NPU deployment.
+#
+# 对齐 v2 PR-4 升级环境（2026-05-26 拍板）：
+#   CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0
+#   driver 25.0.rc1.1 保持不变（与 CANN 8.5.0 兼容）
+#
+# 安装顺序（torch / torch-npu / triton-ascend 需要专用 index，pip install -r 一次性装
+# 不一定能解析，请按下述命令分步装；其余包用 `pip install -r requirements.txt` 一次到位）：
+#
+#   conda create -n flexhead-c85 python=3.10 -y && conda activate flexhead-c85
+#   pip install torch==2.7.1+cpu --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch_npu==2.7.1.post4
+#   pip uninstall triton -y  # 防 community Triton 与 triton-ascend 互斥
+#   pip install triton-ascend==3.2.0 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+#   pip install -r requirements.txt
+#   pip install -e .
+#
+# 三层校验：
+#   python -c "import torch, torch_npu, triton_ascend; print(torch.npu.is_available())"
+#   python tests/test_env.py
+#   pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py
+#
+# 同时升 CANN 后建议复测 sparse_mode quirk（CANN 8.5 是否修复，知识库完整性）：
+#   pytest tests/test_sparse_mode_quirk.py -v
 
 # Ascend NPU stack.
-# 对齐 CANN 8.2.RC1（v2 起）；driver 25.0.rc1.1 保持不变。
-torch==2.6.0
-torch-npu==2.6.0
+# 这三行仅作版本声明，实际安装走上面的分步命令（专用 index）。
+torch==2.7.1+cpu
+torch-npu==2.7.1.post4
+triton-ascend==3.2.0
 
 # Core runtime.
+# 4.57.3 / 0.34.2 是 v1/v2 路径 A 用过的稳定组合；CANN 升级后如有兼容问题再调
+# （torch 2.7 可能要求 transformers / accelerate 也跟着升）。
 accelerate==0.34.2
 numpy==1.26.4
 transformers==4.57.3

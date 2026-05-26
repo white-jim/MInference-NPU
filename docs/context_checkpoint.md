@@ -1,7 +1,7 @@
 # 上下文检查点 — MInference 1.0 → 昇腾 NPU 算法迁移
 
 > 用途：在新会话中快速恢复工作上下文。详细信息在各专题文档里，本文件只列必读关键点。
-> 最近更新：2026-05-26 — **PR-3 代码落地**。`_build_vs_mask_direct` 在 NPU 上一步从 (v_idx, s_idx) 构建 mask，完全跳过 `convert_vertical_slash_indexes` 双指针。整条 vertical-slash 路径里**最后一处 host-bound Python 循环已消除**。算法变种说明：direct mask 与 v1 不 bit-identical（v1 继承上游 CUDA 块对齐扩展近似，direct 用真实区间更精确），direct 是 v1 visible 子集，CPU 全套 16/16 PASS。待 NPU 实测回填性能表（详见 §12.4）。
+> 最近更新：2026-05-26 — **路径 A 弃用，v2 转向 triton-ascend（PR-4）**。PR-3 把 8K prefill 拉到 7.28s（vs dense 1.95s，3.73×），但 16K 实测 21.95s vs dense 4.68s（4.69×，差距扩大不收敛），且 O(S²) bool mask 在 128K 必 OOM —— **路径 A 是死胡同**：mask 路径不是真稀疏，计算量不减，永远比 dense 慢，长上下文又跑不动，**完全偏离 MInference 项目初衷**。用户 2026-05-26 拍板舍弃路径 A，环境升级到 CANN 8.5.0 + torch_npu 2.7.1.post4 + triton-ascend 3.2.0（B 选项），走 **triton-ascend 真稀疏 FA kernel**（PR-4，详见 §13）。
 > 工作目录：`D:\tempt\算法迁移\`（不是 git repo；子目录 `MInference-NPU/` 是 git repo）
 
 ---
@@ -18,14 +18,14 @@
 
 ## 2. v1 决策（已拍板，写在 `docs/migration_plan_v1.md`）
 
-| 维度 | 选择 |
-|---|---|
-| 迁移范围 | vertical_and_slash + block_sparse + stream_llm + dense fallback |
-| 排除项 | dilated / static / tri_shape / kvcompress / dist_ops / vLLM 集成 / FA3 / KV-CPU offload |
-| 算子主路径 | `npu_fusion_attention` + bool mask（路径 A）；Triton-Ascend 留 v2（CANN 8.1.RC1 下版本矩阵不匹配） |
-| `convert_vertical_slash_indexes` | CPU Python 双指针（M4-a）；NPU kernel 留 v2 |
-| 框架宿主 | HF transformers + torch_npu；accelerate `device_map="auto"` 多卡 OK |
-| 产出形态 | 独立 `MInference-NPU/` 完整 py 源 + tests + examples + docs + 独立 setup.py |
+| 维度 | v1 选择 | v2 PR-4 修订（2026-05-26） |
+|---|---|---|
+| 迁移范围 | vertical_and_slash + block_sparse + stream_llm + dense fallback | 不变 |
+| 排除项 | dilated / static / tri_shape / kvcompress / dist_ops / vLLM 集成 / FA3 / KV-CPU offload | 不变 |
+| **算子主路径** | `npu_fusion_attention` + bool mask（路径 A） | **改走 triton-ascend 真稀疏 FA kernel（路径 B）**。路径 A 归档到 `minference/legacy/path_a/`，原因见 §13 |
+| `convert_vertical_slash_indexes` | CPU Python 双指针（M4-a） | PR-3 已用 `_build_vs_mask_direct` 跳过；PR-4 进一步整体重写到 triton-ascend kernel 内部 |
+| 框架宿主 | HF transformers + torch_npu；accelerate `device_map="auto"` 多卡 OK | 不变 |
+| 产出形态 | 独立 `MInference-NPU/` 完整 py 源 + tests + examples + docs + 独立 setup.py | 不变 |
 
 ---
 
@@ -310,24 +310,25 @@ M5 不引入新代码，只做实机验证：
 
 ### 12.2 8K prefill 性能曲线
 
-| 版本 | 8K + 4 decode 用时 | Δ vs v1 | 收益来源 |
-|---|---|---|---|
-| v1（per-head + Python mask loop） | 308.53 s | — | — |
-| v2 PR-1（batched VS） | 276.67 s | −32 s | 32 次 `npu_fusion_attention` launch 合并为 1 次 |
-| **v2 PR-2（vec mask build）** | **139.30 s** | **−169 s / 2.2×** | 4096 次/层的 host-bound 小 NPU launch → 几个大张量 op |
+| 版本 | 8K + 4 decode 用时 | Δ vs v1 | 相对 dense | 收益来源 |
+|---|---|---|---|---|
+| v1（per-head + Python mask loop） | 308.53 s | — | 158× | — |
+| v2 PR-1（batched VS） | 276.67 s | −32 s / 1.12× | 141× | 32 次 `npu_fusion_attention` launch 合并为 1 次 |
+| v2 PR-2（vec mask build） | 139.30 s | −169 s / 2.2× | 71× | 4096 次/层的 host-bound 小 NPU launch → 几个大张量 op |
+| **v2 PR-3（direct mask）** | **7.28 s** | **−301 s / 42×** | **3.73×** | 消除 `convert_vertical_slash_indexes` 双指针（~131072 次/prefill CPU iter）→ 整条 vs 路径无 Python 循环 |
+| dense 8K baseline（同 NPU） | 1.95 s | — | 1.0× | 天花板：单 `npu_fusion_attention(H=32,S=8K)` 大算子 |
 
-`bit-identical` 维度全程未破，`pytest` 全程 93 passed。
+**输出文本与 dense 完全一致**（`' fox jumps over the'`），算法正确性确认。
 
-### 12.3 当前问题：剩余 139 s 仍 ~99% host-bound
+`bit-identical` 维度：T1-T4 全程未破；T5/T6 验证 PR-3 算法变种（direct mask 是 v1 mask 的 visible 子集，差异仅来自上游 CUDA 块对齐扩展，详见 §12.4）。`pytest` 用户实测 PR-3 后全套 PASS（无回归）。
 
-**纯 NPU 计算量估算**：H=32, S=8K, D=128, fp16, 32 层 ≈ 8 TFLOPS，910B 上 ~25 ms 计算 + 几十 ms HBM 带宽 → **真实 NPU 时间预计 < 200 ms**，对比实测 139 s **意味着 >99% 时间消耗在 host 侧**。
+### 12.3 PR-2 当时的瓶颈分析（已由 PR-3 解决，仅留作历史参考）
 
-**剩余瓶颈定位（未实测确认，待 profile 或下一轮改造验证）**：`minference/backend_npu/cuda_shim.py::convert_vertical_slash_indexes` 仍是纯 CPU Python 双指针：
-- 每层调一次，内部 `for b: for h: for bq:` = 1 × 32 × 128 = **4096 次** `_process_block` + `torch.tensor(blk_buf, int32)` 分配 + `block_count[b,h,bq] = n` CPU 张量元素写
-- × 32 层 = **每次 prefill ~131072 次** Python + CPU PyTorch iter
-- 这是 PR-2 之后**整条 v2 路径里唯一剩下的 Python 循环 / 唯一不在 NPU 上跑的算子**
+**纯 NPU 计算量估算**：H=32, S=8K, D=128, fp16, 32 层 ≈ 8 TFLOPS，910B 上 ~25 ms 计算 + 几十 ms HBM 带宽 → **真实 NPU 时间预计 < 200 ms**，对比 PR-2 实测 139 s **意味着 >99% 时间消耗在 host 侧**。
 
-PR-1 / PR-2 完成后，热点链条已经从「外层 per-head 循环 → mask 构建三重循环」清空到「`convert_vertical_slash_indexes` 双指针」这唯一一处，定位明确。
+**剩余瓶颈定位（PR-2 后）**：`minference/backend_npu/cuda_shim.py::convert_vertical_slash_indexes` 仍是纯 CPU Python 双指针 —— 每层调一次，内部 `for b: for h: for bq:` = 1 × 32 × 128 = **4096 次** `_process_block` + `torch.tensor(blk_buf, int32)` 分配 + `block_count[b,h,bq] = n` CPU 张量元素写，× 32 层 = **每次 prefill ~131072 次** Python + CPU PyTorch iter。
+
+**PR-3 处理结果**：完全消除该路径 —— direct mask 在 NPU 上一步从 (v_idx, s_idx) 构建。8K prefill 从 139.30s → 7.28s（**42× 整体提速 / 19.1× 单步**），距离 dense 1.95s 天花板 3.73× —— host-bound 主导地位被打破，剩余开销主要在 NPU 端的 mask 构建张量算子（cumsum / scatter / repeat_interleave）+ 在线估计 topk。
 
 ### 12.4 PR-3：消除 convert_vertical_slash_indexes（2026-05-26 完成，代码已落地，待 NPU 实测）
 
@@ -356,12 +357,128 @@ PR-1 / PR-2 完成后，热点链条已经从「外层 per-head 循环 → mask 
 - `minference/ops/vertical_slash_kernel_npu.py`（新增 `_build_vs_mask_direct` + `_vertical_slash_pytorch_ref_legacy`；`_vertical_slash_npu` / `_pytorch_ref` 切到 direct）
 - `tests/test_minference_batched_vs.py`（新增 T5/T6 + __main__ 入口更新）
 
-**待用户做的事**：
-- [ ] 在 NPU 服务器（env `flexhead`）跑 `pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py` 确认零回归（理论上 93 passed → 93+ passed，T5/T6 新增）
-- [ ] 跑 `examples/run_hf_minimal.py --attn_type minference` 8K 测一发实际 prefill 用时；预计 host-bound 进一步降低至秒级（因为整条 vs 路径已无 Python 循环）
-- [ ] 跑 8K dense 基线（之前 §12.3 §12.4 提到）确认天花板
-- [ ] 实测数据回填本节性能表 + 决定下一步（P1 长上下文 / P2 stream_llm/block_sparse batch 化）
+**实测验证（2026-05-26 用户完成）**：
+- [x] NPU 服务器（env `flexhead`）`pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py` 全套 PASS，零回归 + T5/T6 新增 PASS
+- [x] `examples/run_hf_minimal.py --attn-type minference --ctx-len 8192 --max-new-tokens 4`：**7.28s**（对比 PR-2 139.30s，单步 19.1× 提速 / 整体 42× from v1）
+- [x] dense 8K baseline：1.95s（天花板）—— PR-3 相对 dense **3.73× slow**，host-bound 主导地位已破
+- [x] 输出文本与 dense 一致 `' fox jumps over the'`，算法正确性确认
 
-### 12.5 待解决
+性能表已回填到 §12.2。
 
-- [ ] PR-3 实测验证（见 §12.4）；性能表回填后决定下一轮优化方向
+### 12.5 PR-3 之后路径 A 的终结（2026-05-26 用户实测 16K + 拍板弃用）
+
+**16K 实测**（同 dense 8K 命令换 ctx-len=16384）：
+
+| ctx | attn | 时间 | 相对 dense |
+|---|---|---|---|
+| 8K | minference | 7.28s | 3.73× |
+| 8K | dense | 1.95s | 1.0× |
+| 16K | minference | **21.95 s** | **4.69×** |
+| 16K | dense | 4.68 s | 1.0× |
+
+**问题暴露**：差距从 8K 的 3.73× **扩大到 16K 的 4.69×**，不收敛。原因如 §13.1 §13.2 阐述 —— **路径 A 不是真稀疏，永远跑不过 dense**。
+
+---
+
+## 13. v2 路径 B：triton-ascend 真稀疏 FA kernel（PR-4，2026-05-26 立项）
+
+### 13.1 为什么路径 A 是死胡同
+
+**核心结论**：`npu_fusion_attention + bool mask` 不是真稀疏 —— mask 只把部分位置 softmax 设 -inf，**计算量仍是 H × S² × D 的 dense QK matmul**，没有 FLOPs 节省。
+
+| 维度 | 路径 A 现状 | 影响 |
+|---|---|---|
+| 算法本质 | dense FA + mask 屏蔽 | **永远比 dense 慢**（多了 mask 构建开销） |
+| O(S²) bool mask 显存 | 8K=64MiB / 16K=256MiB / 32K=1GiB / 128K=16GiB | **128K 必 OOM**，32K 是单卡甜区 |
+| MInference 算法价值 | 仅保留 "按 v_idx/s_idx 选 token" 骨架，丢失 "少算 K/V" 的本质收益 | 项目核心价值丧失 |
+| 路径 A 优化天花板 | 逼近 dense（永远到不了） | 继续优化无意义 |
+
+**继续在路径 A 上优化最多只能减少 host-bound 开销，无法解决根本问题**。PR-3 已经把 host-bound 主导消除（19.1× 单步提速），但仍输 dense 3.73-4.69×，且差距随 S 扩大，**确证路径 A 是设计死胡同**。
+
+### 13.2 路径 B 立项：triton-ascend 真稀疏 FA kernel
+
+参考上游 MInference 的 Triton sparse FA kernel（`MInference/minference/ops/pit_sparse_flash_attention_v2.py` 等），按 v_idx/s_idx 的 block **跳过整块 K/V 计算**，**不构建 mask、计算量真减少**。
+
+NPU 对应方案：**triton-ascend**（华为开源 Triton for Ascend）。
+
+**为什么 v1 当时排除 triton-ascend**：CANN 8.1.RC1 与 triton-ascend 版本矩阵不匹配（§2 决策）。**现在升级到 CANN 8.5.0 + triton-ascend 3.2.0 后该限制解除**。
+
+**外部参考**：
+- triton-ascend 3.2.0：https://github.com/triton-lang/triton-ascend
+- tilelang-ascend（更高层 DSL，已有 SparseFlashAttention / DeepSeek V4 reference 实现）：https://github.com/tile-ai/tilelang-ascend
+- 上游 MInference Triton VS kernel：`MInference/minference/ops/pit_sparse_flash_attention_v2.py`
+
+### 13.3 环境升级目标（用户 2026-05-26 选定 B 选项）
+
+| 维度 | 旧（v1/v2 路径 A） | 新（v2 路径 B / PR-4） |
+|---|---|---|
+| 驱动 / npu-smi | 25.0.rc1.1 | **不变**（CANN 8.5.0 与 25.0.rc1.1 兼容） |
+| CANN Toolkit + Kernels | 8.2.RC1 | **8.5.0** |
+| torch / torch_npu | 2.6.0 / 2.6.0 | **2.7.1 / 2.7.1.post4** |
+| triton-ascend | 不装 | **3.2.0**（pip install triton-ascend，注意 community Triton 互斥） |
+| Python | 3.10 | 不变（3.9-3.11 都行） |
+| transformers / accelerate | 4.57.3 / 0.34.2 | 暂不变，升完 CANN 后验证兼容；如挂再升 |
+
+**官方矩阵**（2026-05 调研结果）：
+| triton-ascend | CANN | torch_npu | Python | release |
+|---|---|---|---|---|
+| 3.2.1 | 9.0.0 | 2.7.1.post4 | 3.9-3.11 | 2026-04-30（跨度大，不取） |
+| **3.2.0** | **8.5.0** | **2.7.1.post4** | **3.9-3.11** | **2026-01-16（用户选定）** |
+| 3.2.0rc4 | 8.3.RC2 / 8.3.RC1 | 2.7.1.post4 | 3.9-3.11 | 2025-11-20（rc 不取） |
+
+**用户侧升级 SOP**（新 conda env 名建议 `flexhead-c85`，旧 `flexhead` 保留作回滚）：
+1. 备份旧 env：`conda env export -n flexhead > ~/flexhead-cann82.yml`
+2. 装新 CANN 8.5.0（toolkit + kernels-910b），不覆盖 8.2.RC1
+3. `source /usr/local/Ascend/ascend-toolkit/set_env.sh` → 校验 `ASCEND_HOME_PATH` 指向 8.5.0
+4. `conda create -n flexhead-c85 python=3.10 -y && conda activate flexhead-c85`
+5. `pip install torch==2.7.1+cpu --index-url https://download.pytorch.org/whl/cpu`
+6. `pip install torch_npu==2.7.1.post4`
+7. `pip install triton-ascend==3.2.0 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi`（注意：装 triton-ascend 前确认无 community Triton 占位）
+8. 把 `MInference-NPU/requirements.txt` 更新到 2.7.1，`pip install -r requirements.txt && pip install -e .`
+9. 三层校验：
+   - `python -c "import torch; import torch_npu; import triton_ascend; print(torch.npu.is_available())"`
+   - `python tests/test_env.py`
+   - `pytest tests/ -v --ignore=tests/test_sparse_mode_quirk.py`（M1-M5 复测，理论 93+ passed）
+10. 复测 `sparse_mode=2/4`（CANN 8.5.0 可能修复，详见 §11.2 / §13.5）
+
+### 13.4 PR-4 路线图
+
+| PR | 内容 | 工作量 | 主要风险 |
+|---|---|---|---|
+| **PR-4-env** | 用户侧环境升级（见 §13.3） | 0.5 天 | M1-M5 在新环境的回归（PR-3 mask 路径 A 应该都仍跑通，因为不依赖 triton-ascend） |
+| **PR-4-poc** | triton-ascend 最简 dense FA kernel + 与 `npu_fusion_attention` dense 8K/16K 对比 | 3-5 天 | triton-ascend 对 attention 类 kernel 的成熟度；性能是否同量级 |
+| **PR-4-archive** | path A 代码搬到 `minference/legacy/path_a/`，入口简化 | 1-2 天 | 测试要保留作 deprecated 回归 |
+| **PR-4-VS** | triton-ascend 真稀疏 vertical-slash FA kernel（核心 PR） | 2-3 周 | 复杂控制流（按 v_idx 跳块）；block size 调优；NPU 内存层次适配 |
+| PR-4-BS | triton-ascend block-sparse FA kernel | 1-2 周 | 同上 |
+| PR-4-SL | triton-ascend streaming kernel | 1-2 周 | 同上 |
+| **PR-4-bench** | 8K / 16K / 32K / 64K / **128K** 长上下文实测 + 性能/精度报告 | 1 周 | 32K+ 的显存 / 调度问题 |
+
+**总工作量**：6-10 周（除环境升级 0.5 天）
+
+### 13.5 PR-4 验收标准
+
+| 维度 | 目标 |
+|---|---|
+| 算法 | 真稀疏：minference vertical-slash 算出与 dense **容差对比**（fp16 max_abs < 1e-2） |
+| 性能 8K | minference < dense（路径 A 永远到不了） |
+| 性能 32K | minference 显著 < dense（稀疏度提升放大优势） |
+| 长上下文 | **128K 单卡可跑**（路径 A 必 OOM 的红线） |
+| 测试 | 全套 M1-M5 + PR-4 新增（kernel 单测 + 长上下文端到端） |
+| 显存 | 128K 单卡 fp16 估算 ≤ 64 GiB（910B3 单卡 64GiB HBM，刚好可跑） |
+
+### 13.6 路径 A 历史价值（虽然弃用，但仍有意义）
+
+- 验证了 `npu_fusion_attention` + bool mask 的完整链路（patch → forward → kernel → mask）
+- 验证了 NPU 上 transformers 4.57 / accelerate device_map 等基础设施
+- 提供了 `_vertical_slash_pytorch_ref` 等 CPU reference 实现，可继续作为 PR-4 kernel 的黄金参考
+- M5 实测产出的 host-bound profile 数据 + PR-1/PR-2/PR-3 的优化经验，对 PR-4 kernel 调优有借鉴价值
+
+→ **不删除路径 A 代码，搬到 legacy/ 归档**。
+
+---
+
+## 14. 等用户做完环境升级（PR-4-env）回来执行的事
+
+- [ ] 在 NPU 服务器执行 §13.3 SOP（升 CANN 8.5.0 / 装 triton-ascend 3.2.0 / M1-M5 复测零回归）
+- [ ] 复测 `sparse_mode=2/4` 在 CANN 8.5.0 上的行为（可能修复或仍未修，影响弃用范围）
+- [ ] 把回归结果 + sparse_mode 复测结果回填本节，主对话据此启动 PR-4-poc
