@@ -48,6 +48,11 @@ tqdm==4.67.1
 packaging==25.0
 PyYAML==6.0.3
 
+# triton-ascend 3.2.0 的 ascend backend（utils.py）会 import pybind11；
+# 上游 wheel 没把它声明成强依赖，缺了会在 `import triton` 时直接 ModuleNotFoundError
+# （CANN 8.5.0 + triton-ascend 3.2.0 实测，2026-05-26）。
+pybind11==2.13.6
+
 # Tests.
 pytest==9.0.2
 pytest-xdist==3.6.1
