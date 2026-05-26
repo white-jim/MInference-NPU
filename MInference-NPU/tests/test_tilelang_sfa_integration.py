@@ -78,35 +78,14 @@ _CANDIDATE_IMPORT_PATHS = [
 
 
 def _load_sparse_attention_fwd_from_example_source(path: str) -> tuple[Callable, str] | None:
-    """Load only the function definition from the official example.
+    """Disabled source-prefix loader for the official example.
 
-    The example file has a top-level smoke test after ``func = sparse_attention_fwd(...)``.
-    Importing the module directly would compile and run that large case before this test
-    even starts, so for the example path we execute only the prefix that defines the JIT
-    function.
+    Executing only the prefix looks attractive because the example has a heavy top-level
+    smoke test, but tilelang's JIT depends on the function being imported as part of the
+    real module. Prefix execution can trip a TVM TIR builder error around Python globals
+    such as ``REPLICATE_H``. Keep this hook disabled and use normal import.
     """
-    spec = importlib.util.find_spec(path)
-    origin = getattr(spec, "origin", None) if spec is not None else None
-    if origin is None or not origin.endswith("example_sparse_flash_attn.py"):
-        return None
-
-    with open(origin, "r", encoding="utf-8") as f:
-        source = f.read()
-    marker = "\nfunc = sparse_attention_fwd("
-    if marker not in source:
-        return None
-
-    namespace = {
-        "__file__": origin,
-        "__name__": f"{path}.__sfa_prefix__",
-        "__package__": path.rpartition(".")[0],
-    }
-    prefix = source.split(marker, 1)[0]
-    exec(compile(prefix, origin, "exec"), namespace)
-    func = namespace.get("sparse_attention_fwd")
-    if func is None:
-        return None
-    return func, f"{path} (source prefix)"
+    return None
 
 
 def _probe_sparse_attention_fwd() -> tuple[Callable, str]:
