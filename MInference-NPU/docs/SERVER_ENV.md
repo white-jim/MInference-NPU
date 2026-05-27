@@ -12,7 +12,7 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python <cmd>
 
 - CANN: `~/ascend/cann/8.5.0/cann-8.5.0`
 - conda env: `flexhead-tl`
-- TileLang source: `~/tilelang-ascend`
+- TileLang source: `~/tilelang-ascend`（当前只为 `block_sparse` path-B 需要）
 - local Phi3: `/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 - HF cache: `/data/guoshiyao/resources/.hf_cache`
 
@@ -58,9 +58,10 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python -m pytest test
 
 ## 已知结论
 
-- 当前 path-B 可以命中真实 forward。
-- Dense baseline 仍远快于 path-B probe。
-- Clean probe 已排除 VS 干扰，瓶颈在 grouped TileLang path-B wrapper/kernel。
+- `stream_llm` 已退出 TileLang，走 hardware band + sink + LSE merge。
+- `stream_llm` branch 在 64K probe 中为 `0.122s / 12 calls`，64K isolated kernel 抽样误差约 `9.77e-4`。
+- 当前 stream probe 端到端没有实质加速：64K dense run2 `29.61s`，stream probe run2 `28.88s`。原因是只有 43 / 1024 heads 走 `stream_llm`，其余为 dense-others。
+- 下一阶段重点是 `block_sparse`：扩大稀疏覆盖面，解决 TileLang path-B 的 fold-into-batch、小 H padding 到 16、单 token gather 等瓶颈。
 - `--profile-branches` 会同步 NPU，只用于定位，不作为普通性能数。
 - `--num-runs 2` 用于区分 first-call/JIT 和 steady-state。
 

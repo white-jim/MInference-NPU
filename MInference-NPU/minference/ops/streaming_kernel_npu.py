@@ -57,6 +57,10 @@ except ImportError:  # pragma: no cover — 非 NPU 环境
 __all__ = ["streaming_forward"]
 
 
+_COMPRESSED_MASK_SIZE = 2048
+_COMPRESSED_CAUSAL_MASK_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
 # ----------------------------------------------------------------------------
 # head_dim 对齐（与上游一致）
 # ----------------------------------------------------------------------------
@@ -175,6 +179,19 @@ def _unpack_fa_result(result, *, where: str):
     return result[0], _take_first_lane(result[1]), _take_first_lane(result[2])
 
 
+def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    key = (device, torch.bool)
+    cached = _COMPRESSED_CAUSAL_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = torch.triu(
+        torch.ones((_COMPRESSED_MASK_SIZE, _COMPRESSED_MASK_SIZE), device=device, dtype=torch.bool),
+        diagonal=1,
+    )
+    _COMPRESSED_CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
 def _call_band_fa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -195,6 +212,7 @@ def _call_band_fa(
         input_layout="BNSD",
         scale=scale,
         sparse_mode=4,
+        atten_mask=_compressed_causal_mask(q.device),
     )
     try:
         return torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
@@ -225,7 +243,6 @@ def _streaming_npu(
     * ``q.device.type == "npu"`` 且 ``torch_npu`` 可用
     * head_dim 已 pad 至 ``_ALLOWED_HEAD_DIMS`` 内
     * ``k_len > n_local``（``k_len <= n_local`` 在外层短路为 causal dense）
-    * S_q == S_k（prefill；decode q_len=1 走 ``decode_dense`` 不进本函数）
 
     返回 ``[B, H, S_q, D_padded]``；外层 ``streaming_forward`` 把 head_dim 截回原值。
     """
@@ -235,20 +252,31 @@ def _streaming_npu(
     s_k = k.shape[2]
     scale = 1.0 / math.sqrt(head_d)
 
+    if s_q > s_k:
+        raise ValueError(f"streaming attention requires S_q <= S_k, got S_q={s_q}, S_k={s_k}")
+
     # --- Pass 1: sliding window via hardware band FA (sparse_mode=4) ---
-    # 视野：每个 query row r 看到 K[r - pre_tokens, r + next_tokens]。
-    # 想要 [abs_i - n_local + 1, abs_i] 的因果 sliding window → pre = n_local-1, next = 0。
-    # band 自动对负位置 clamp 到 0，所以早期 query 不需要额外处理。
+    # sparse_mode=4 按 query row id 对齐 key row id。对于 S_q < S_k 的增量/后缀
+    # 形态，在 Q 前补 dummy rows，把真实 query row i 移到 abs_i = S_k-S_q+i。
     pre_tokens = max(int(n_local) - 1, 0)
     next_tokens = 0
+    q_band = q
+    band_offset = s_k - s_q
+    if band_offset:
+        q_prefix = q.new_zeros((bsz, n_heads, band_offset, head_d))
+        q_band = torch.cat((q_prefix, q), dim=2).contiguous()
     pass1 = _call_band_fa(
-        q, k, v,
+        q_band, k, v,
         n_heads=n_heads,
         scale=scale,
         pre_tokens=pre_tokens,
         next_tokens=next_tokens,
     )
     o1, m1, l1 = _unpack_fa_result(pass1, where="streaming pass1 (band)")
+    if band_offset:
+        o1 = o1[:, :, band_offset:, :]
+        m1 = m1[:, :, band_offset:, :]
+        l1 = l1[:, :, band_offset:, :]
     # 早期 query 在极端情况下可能整行被 band 屏蔽（abs_i < 0 不会发生于 prefill，
     # 但 n_local 极小且早 query 时可能 l1 == 0）；nan_to_num 防御 LSE 合并出 NaN。
     l1 = torch.nan_to_num(l1, nan=0.0)

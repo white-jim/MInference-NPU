@@ -104,7 +104,13 @@ def _compare(name: str, out_tl: torch.Tensor, out_ref: torch.Tensor, threshold: 
     return ok
 
 
-def run_case(name: str, max_blocks: int, device: torch.device, heads: int = H) -> bool:
+def run_case(
+    name: str,
+    max_blocks: int,
+    device: torch.device,
+    heads: int = H,
+    use_contiguous_range_load: bool = False,
+) -> bool:
     print("\n" + "=" * 60)
     print(f"[case] {name}")
     print("=" * 60)
@@ -130,6 +136,7 @@ def run_case(name: str, max_blocks: int, device: torch.device, heads: int = H) -
         kv_group=KV_GROUP,
         block_I=BLOCK,
         q_start_index_s=0,
+        use_contiguous_range_load=use_contiguous_range_load,
     )
 
     try:
@@ -257,6 +264,8 @@ def main() -> int:
             "one-block",
             "two-block",
             "h1-one-block",
+            "range-load-one-block",
+            "range-load-two-block",
             "stream-llm",
             "stream-llm-pad",
             "h1-stream-llm-pad",
@@ -280,6 +289,20 @@ def main() -> int:
         results["two-block"] = run_case("two-block", max_blocks=2, device=device)
     if args.case in ("h1-one-block", "all"):
         results["h1-one-block"] = run_case("h1-one-block", max_blocks=1, device=device, heads=1)
+    if args.case in ("range-load-one-block", "all"):
+        results["range-load-one-block"] = run_case(
+            "range-load-one-block",
+            max_blocks=1,
+            device=device,
+            use_contiguous_range_load=True,
+        )
+    if args.case in ("range-load-two-block", "all"):
+        results["range-load-two-block"] = run_case(
+            "range-load-two-block",
+            max_blocks=2,
+            device=device,
+            use_contiguous_range_load=True,
+        )
     if args.case in ("stream-llm", "all"):
         results["stream-llm"] = run_stream_llm_case(device)
     if args.case in ("stream-llm-pad", "all"):

@@ -2,7 +2,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 #
 # MInference-NPU 安装脚本。
-# 当前工作区只保留 PR-4 TileLang path-B smoke/profiling 所需 Python 包。
+# 当前工作区只保留 PR-4 Ascend NPU 稀疏注意力 smoke/profiling 所需 Python 包。
 
 from setuptools import find_packages, setup
 
@@ -12,11 +12,12 @@ with open("minference/version.py", "r") as f:
 setup(
     name="minference-npu",
     version=VERSION,  # noqa: F821 — 来自 exec 注入
-    description="MInference PR-4 TileLang path-B adaptation for Huawei Ascend NPU",
+    description="MInference PR-4 sparse attention adaptation for Huawei Ascend NPU",
     long_description=(
         "Trimmed Ascend NPU workspace for Phi-3 long-context smoke/profiling. "
-        "The active sparse paths are stream_llm and block_sparse via TileLang, "
-        "with dense as the baseline and fallback."
+        "stream_llm uses hardware band attention plus sink/LSE merge; "
+        "block_sparse remains on the TileLang path-B track, with dense as "
+        "the baseline and fallback."
     ),
     author="MInference-NPU contributors",
     license="MIT",

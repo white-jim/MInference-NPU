@@ -59,6 +59,11 @@ _ALLOWED_HEAD_DIMS = (16, 32, 64, 128, 256, 512)
 # 路径 B（TileLang-Ascend）可覆盖更长序列
 _MAX_SEQ_FOR_MASK = 16384
 
+# 短上下文优先走 bool-mask NPU path A，作为 4K-16K 过渡路径与 TileLang path-B
+# 的性能对照。设为 0 可强制所有 fp16 NPU block_sparse 先尝试 TileLang。
+_PREFER_MASK_MAX_SEQ_ENV = "MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ"
+_DEFAULT_PREFER_MASK_MAX_SEQ = 16384
+
 # 默认 block size（与上游 block_sparse_flash_attention.py 一致）
 _DEFAULT_BLOCK_SIZE = 64
 
@@ -82,6 +87,25 @@ def _pad_head_dim(t: torch.Tensor, target_d: int) -> torch.Tensor:
     if cur == target_d:
         return t
     return F.pad(t, (0, target_d - cur))
+
+
+def _preferred_mask_max_seq() -> int:
+    raw = os.environ.get(_PREFER_MASK_MAX_SEQ_ENV)
+    if raw is None or raw == "":
+        return _DEFAULT_PREFER_MASK_MAX_SEQ
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        warnings.warn(
+            f"{_PREFER_MASK_MAX_SEQ_ENV}={raw!r} 不是合法整数；"
+            f"回退默认值 {_DEFAULT_PREFER_MASK_MAX_SEQ}。",
+            stacklevel=2,
+        )
+        return _DEFAULT_PREFER_MASK_MAX_SEQ
+
+
+def _should_prefer_mask_npu(seq_len: int) -> bool:
+    return seq_len <= min(_MAX_SEQ_FOR_MASK, _preferred_mask_max_seq())
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +363,7 @@ def _block_sparse_tilelang_npu(
         kv_group=1,
         block_I=block_size,
         q_start_index_s=S_k - S_q,
+        use_contiguous_range_load=(S_k % block_size == 0),
     )
 
     q_bshd = q_flat.transpose(1, 2).contiguous()
@@ -372,7 +397,9 @@ def block_sparse_attention(
         ``[B, H, S, D]``，与 ``q`` 同 dtype 同 device。
 
     短路 / 降级：
-    * fp16 NPU 输入优先走 TileLang path-B。
+    * fp16 NPU 短序列默认优先走 bool-mask NPU path A，便于 4K-16K 过渡和对照。
+      阈值由 ``MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ`` 控制，设为 0 可强制 TileLang。
+    * 长序列 fp16 NPU 优先走 TileLang path-B。
     * TileLang 不适用时，短序列回退 bool-mask NPU；过长序列回退 causal dense。
     * 非 NPU 设备：走 ``_block_sparse_pytorch_ref`` 参考路径。
 
@@ -405,25 +432,36 @@ def block_sparse_attention(
     # 主路径
     if q.device.type == "npu" and _HAS_TORCH_NPU:
         if q.dtype == torch.float16:
-            try:
-                out = _block_sparse_tilelang_npu(q, k, v, topk_blocks, block_size)
-            except ImportError as exc:
-                warnings.warn(
-                    "block_sparse_attention: TileLang path B is unavailable "
-                    f"({exc}); falling back to path A bool-mask attention.",
-                    stacklevel=2,
-                )
-                if S > _MAX_SEQ_FOR_MASK:
+            if _should_prefer_mask_npu(S):
+                try:
+                    out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
+                except Exception as exc:  # noqa: BLE001
                     warnings.warn(
-                        f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
-                        " bool mask 构建需 O(S²) 内存，退化为 causal dense。",
+                        "block_sparse_attention: short-sequence bool-mask path failed "
+                        f"({exc}); falling back to TileLang path B.",
                         stacklevel=2,
                     )
-                    from ..backend_npu import dense_attention
+                    out = _block_sparse_tilelang_npu(q, k, v, topk_blocks, block_size)
+            else:
+                try:
+                    out = _block_sparse_tilelang_npu(q, k, v, topk_blocks, block_size)
+                except ImportError as exc:
+                    warnings.warn(
+                        "block_sparse_attention: TileLang path B is unavailable "
+                        f"({exc}); falling back to path A bool-mask attention.",
+                        stacklevel=2,
+                    )
+                    if S > _MAX_SEQ_FOR_MASK:
+                        warnings.warn(
+                            f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
+                            " bool mask 构建需 O(S²) 内存，退化为 causal dense。",
+                            stacklevel=2,
+                        )
+                        from ..backend_npu import dense_attention
 
-                    out = dense_attention(q, k, v, causal=True)
-                else:
-                    out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
+                        out = dense_attention(q, k, v, causal=True)
+                    else:
+                        out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
         else:
             if S > _MAX_SEQ_FOR_MASK:
                 warnings.warn(

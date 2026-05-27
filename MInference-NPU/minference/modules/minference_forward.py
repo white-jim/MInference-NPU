@@ -6,7 +6,7 @@
 Only three per-head pattern types are active:
 
 * ``dense``: dense baseline / non-target clean-probe heads.
-* ``stream_llm``: TileLang path-B streaming wrapper.
+* ``stream_llm``: Ascend hardware band + sink + LSE merge.
 * ``block_sparse``: TileLang path-B block-sparse wrapper.
 
 Legacy sparse patterns are intentionally not implemented in this trimmed tree.

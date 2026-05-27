@@ -1,13 +1,15 @@
 # MInference-NPU
 
-当前工作区只保留 PR-4 方向：在 Ascend NPU 上验证并优化 Phi-3 的 TileLang path-B 稀疏注意力。
+当前工作区只保留 PR-4 方向：在 Ascend NPU 上验证并优化 Phi-3 的真稀疏注意力。
 
 ## 当前目标
 
 - 只聚焦 `stream_llm` 和 `block_sparse`。
-- 用 Phi-3-mini-128k-instruct 做 4K/8K/16K 短阶梯验证。
+- `stream_llm` 已从 TileLang 退出，改为 Ascend hardware band + sink + LSE merge。
+- `block_sparse` 仍在 TileLang path-B，下一阶段重点改造。
+- 用 Phi-3-mini-128k-instruct 做 4K/8K/16K/32K/64K 阶梯验证。
 - 速度必须始终和 `--attn-type dense` baseline 对比。
-- 暂不继续扩到 128K/256K，直到短长度下的端到端瓶颈清楚。
+- 当前 stream probe 只覆盖 43 / 1024 heads，不能代表全模型稀疏收益。
 
 ## 目录
 
@@ -42,7 +44,7 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python examples/run_h
 
 ## 最新结论
 
-- Phi3 probe path-B 可以命中，43 个目标 heads 会聚合为 6 次 grouped TileLang 调用。
-- Dense baseline 明显更快：4K dense 约 `0.60s`。
-- Clean probe steady-state 仍慢：stream 4K 第二轮约 `4.50s`，block 约 `3.50s`。
-- 下一步应优化 grouped TileLang wrapper/kernel，而不是继续加长上下文测试。
+- `stream_llm` kernel 迁移成功：64K isolated stream kernel 抽样误差约 `9.77e-4`，64K probe 中 `stream_llm` branch 为 `0.122s / 12 calls`。
+- 端到端暂未出现实质加速：64K dense run2 `29.61s`，stream probe run2 `28.88s`，约 `1.03x`。
+- 原因是当前 probe 只有 43 个 heads 走 `stream_llm`，其余 981 个 heads 仍是 dense-others，端到端被 dense-others、HF/Phi-3 4D causal mask、QKV/O proj 等公共开销主导。
+- 下一步应把 stream_llm 经验用于 `block_sparse`：扩大稀疏覆盖面，重写/优化 TileLang path-B，优先解决 fold-into-batch、16x small-H padding 浪费和单 token gather。

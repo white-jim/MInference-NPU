@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create compact Phi-3 PR-4 path-B probe configs.
+"""Create compact Phi-3 PR-4 sparse probe configs.
 
 Only the 43 target heads are kept as sparse.  All other heads are written as
 ``dense`` so the current smoke/profiling runs measure only the active
-``stream_llm`` or ``block_sparse`` path-B code.
+``stream_llm`` or ``block_sparse`` sparse code.
 """
 
 from __future__ import annotations

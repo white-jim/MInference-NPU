@@ -1,19 +1,19 @@
 # Copyright (c) 2026
 # Licensed under The MIT License [see LICENSE for details]
-"""Phi-3 HF smoke runner for the current PR-4 TileLang path-B work.
+"""Phi-3 HF smoke runner for the current PR-4 sparse-attention work.
 
 用法：
     # 默认跑本地 Phi-3-mini-128k-instruct，单卡 npu:0
     python examples/run_hf_minimal.py
 
-    # 指定 path-B probe config / 长度
+    # 指定 sparse probe config / 长度
     python examples/run_hf_minimal.py \
         --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_stream_llm_aligned_dense_others.json \
         --ctx-len 4096 \
         --profile-branches --num-runs 2
 
 注意：
-- 当前默认服务 Phi-3 path-B 调试。其他模型配置已从精简工作区移除。
+- 当前默认服务 Phi-3 sparse attention 调试。其他模型配置已从精简工作区移除。
 - 速度必须和 `--attn-type dense` baseline 对比看。
 """
 
@@ -40,7 +40,7 @@ def main() -> int:
     parser.add_argument(
         "--config-path",
         default=None,
-        help="可选：显式 best_pattern JSON。用于 Phi3 path-B probe 等临时配置。",
+        help="可选：显式 best_pattern JSON。用于 Phi3 sparse probe 等临时配置。",
     )
     parser.add_argument(
         "--ctx-len",
@@ -74,7 +74,7 @@ def main() -> int:
         "--num-runs",
         type=int,
         default=1,
-        help="同一进程内重复 generate 次数；用于区分首次 TileLang JIT 与 steady-state。",
+        help="同一进程内重复 generate 次数；用于区分首次开销/JIT 与 steady-state。",
     )
     args = parser.parse_args()
 
@@ -258,7 +258,7 @@ def main() -> int:
     print(f"    完成，累计用时 {dt:.2f}s，解码 {len(new_tokens)} tokens")
     if pathb_counts:
         print(
-            "    path-B hits: "
+            "    sparse path hits: "
             + ", ".join(f"{name}={count}" for name, count in pathb_counts.items())
         )
     if branch_stats:

@@ -54,6 +54,7 @@ def build_sparse_attention_qkv_fwd(
     pad_value: int = -1,
     dtype: str = "float16",
     core_num: int = 24,
+    use_contiguous_range_load: bool = False,
 ):
     """Build a TileLang sparse attention kernel for separate Q/K/V tensors.
 
@@ -76,7 +77,6 @@ def build_sparse_attention_qkv_fwd(
         raise NotImplementedError("PR-4 MVP only supports dtype='float16'")
     if pad_value != -1:
         raise NotImplementedError("PR-4 MVP only supports pad_value == -1")
-
     cache_key = (
         heads,
         dim,
@@ -89,6 +89,7 @@ def build_sparse_attention_qkv_fwd(
         pad_value,
         dtype,
         core_num,
+        use_contiguous_range_load,
     )
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -114,6 +115,7 @@ def build_sparse_attention_qkv_fwd(
         q_start_index_s=0,
         pad_value=-1,
         core_num=24,
+        use_contiguous_range_load=False,
     ):
         sm_scale = (1.0 / dim) ** 0.5 if sm_scale is None else sm_scale
 
@@ -177,6 +179,8 @@ def build_sparse_attention_qkv_fwd(
                 indices_float = T.alloc_ub([BI], "float")
                 k_ub = T.alloc_ub([D], dtype)
                 v_ub = T.alloc_ub([D], dtype)
+                k_ub_gather = T.alloc_ub([BI // 2, D], dtype)
+                v_ub_gather = T.alloc_ub([BI // 2, D], dtype)
                 acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_zero = T.alloc_ub([v_block, BI], accum_dtype)
                 m_i_prev = T.alloc_ub([ub_len], accum_dtype)
@@ -267,18 +271,49 @@ def build_sparse_attention_qkv_fwd(
                                 T.tile.bitwise_and(mask_ub, mask_ub, mask_pad_ub)
                                 T.barrier_all()
 
-                                for bi_i in range(BI // 2):
-                                    pos = indices_ub[bi_i + vid * BI // 2]
-                                    if pos != pad_value:
-                                        T.copy(K[b_i, pos, g_i, :D], k_ub)
-                                        T.copy(V[b_i, pos, g_i, :D], v_ub)
-                                    else:
-                                        T.tile.fill(k_ub, 0.0)
-                                        T.tile.fill(v_ub, 0.0)
+                                if use_contiguous_range_load:
+                                    block_start = indices_ub[0]
+                                    T.copy(
+                                        K[
+                                            b_i,
+                                            block_start + vid * BI // 2 : block_start + (vid + 1) * BI // 2,
+                                            g_i,
+                                            :D,
+                                        ],
+                                        k_ub_gather,
+                                    )
+                                    T.copy(
+                                        V[
+                                            b_i,
+                                            block_start + vid * BI // 2 : block_start + (vid + 1) * BI // 2,
+                                            g_i,
+                                            :D,
+                                        ],
+                                        v_ub_gather,
+                                    )
                                     T.barrier_all()
-                                    T.copy(k_ub, workspace_k[cid, bi_i + vid * BI // 2, :])
-                                    T.copy(v_ub, workspace_v[cid, bi_i + vid * BI // 2, :])
+                                    T.copy(
+                                        k_ub_gather,
+                                        workspace_k[cid, vid * BI // 2 : (vid + 1) * BI // 2, :],
+                                    )
+                                    T.copy(
+                                        v_ub_gather,
+                                        workspace_v[cid, vid * BI // 2 : (vid + 1) * BI // 2, :],
+                                    )
                                     T.barrier_all()
+                                else:
+                                    for bi_i in range(BI // 2):
+                                        pos = indices_ub[bi_i + vid * BI // 2]
+                                        if pos != pad_value:
+                                            T.copy(K[b_i, pos, g_i, :D], k_ub)
+                                            T.copy(V[b_i, pos, g_i, :D], v_ub)
+                                        else:
+                                            T.tile.fill(k_ub, 0.0)
+                                            T.tile.fill(v_ub, 0.0)
+                                        T.barrier_all()
+                                        T.copy(k_ub, workspace_k[cid, bi_i + vid * BI // 2, :])
+                                        T.copy(v_ub, workspace_v[cid, bi_i + vid * BI // 2, :])
+                                        T.barrier_all()
 
                                 T.set_cross_flag("MTE3", 0)
 
@@ -375,6 +410,7 @@ def build_sparse_attention_qkv_fwd(
         q_start_index_s=q_start_index_s,
         pad_value=pad_value,
         core_num=core_num,
+        use_contiguous_range_load=use_contiguous_range_load,
     )
     _KERNEL_CACHE[cache_key] = kernel
     return kernel

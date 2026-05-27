@@ -3,8 +3,9 @@
 # Licensed under The MIT License [see LICENSE for details]
 """Top-level MInference-NPU patch entry.
 
-This trimmed workspace is focused on PR-4 TileLang path-B for Phi-3:
-``stream_llm`` and ``block_sparse`` grouped sparse attention on Ascend NPU.
+This trimmed workspace is focused on PR-4 sparse attention for Phi-3 on Ascend NPU:
+``stream_llm`` uses hardware band attention plus sink/LSE merge, while
+``block_sparse`` remains on the TileLang path-B track.
 Only ``attn_type in {"minference", "dense", "hf"}`` is kept.
 """
 

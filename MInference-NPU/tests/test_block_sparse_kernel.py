@@ -52,6 +52,7 @@ block_sparse_kernel_npu = _load_module(
 
 _block_sparse_pytorch_ref = block_sparse_kernel_npu._block_sparse_pytorch_ref
 _build_block_sparse_mask = block_sparse_kernel_npu._build_block_sparse_mask
+_should_prefer_mask_npu = block_sparse_kernel_npu._should_prefer_mask_npu
 block_sparse_attention = block_sparse_kernel_npu.block_sparse_attention
 
 try:
@@ -223,6 +224,28 @@ def test_head_dim_pad_roundtrip(head_d):
     assert out.dtype == torch.float32
 
 
+def test_short_seq_mask_path_policy_default(monkeypatch):
+    """默认 4K-16K block_sparse 应优先走 bool-mask NPU 对照路径。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", raising=False)
+    assert _should_prefer_mask_npu(4096)
+    assert _should_prefer_mask_npu(16384)
+    assert not _should_prefer_mask_npu(16385)
+
+
+def test_short_seq_mask_path_policy_env_disable(monkeypatch):
+    """阈值设为 0 时禁用短序列 path A，便于强制测 TileLang path-B。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "0")
+    assert not _should_prefer_mask_npu(1)
+    assert not _should_prefer_mask_npu(4096)
+
+
+def test_short_seq_mask_path_policy_env_invalid(monkeypatch):
+    """非法阈值回退默认值，避免 benchmark 环境变量拼错后悄悄改变行为。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "oops")
+    with pytest.warns(UserWarning, match="不是合法整数"):
+        assert _should_prefer_mask_npu(4096)
+
+
 # ---------------------------------------------------------------------------
 # 5. NPU 路径 vs PyTorch ref（仅在 NPU 环境运行）
 # ---------------------------------------------------------------------------
@@ -260,6 +283,28 @@ def test_npu_vs_pytorch_ref(case, dtype):
     assert max_diff < 1e-2, (
         f"[{_desc}] npu vs pytorch_ref: max_abs_diff={max_diff:.2e} >= 1e-2"
     )
+
+
+@pytest.mark.skipif(not _HAS_NPU, reason="需要 torch_npu 且有 NPU 设备")
+def test_tilelang_path_b_forced_vs_pytorch_ref(monkeypatch):
+    """强制短序列走 TileLang path-B，覆盖 block_sparse wrapper 的 range-load 接入。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "0")
+    B, H, S, D = 1, 2, 256, 64
+    topk, block_size = 2, 64
+    device = torch.device("npu:0")
+
+    q, k, v = _make_qkv(B, H, S, S, D, torch.float16, device=str(device), seed=11)
+    ref = _block_sparse_pytorch_ref(
+        q.cpu().float(),
+        k.cpu().float(),
+        v.cpu().float(),
+        topk_blocks=topk,
+        block_size=block_size,
+    ).to(torch.float16)
+
+    out = block_sparse_attention(q, k, v, topk_blocks=topk, block_size=block_size).cpu()
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    assert max_diff < 6e-2, f"TileLang path-B forced vs ref: max_abs_diff={max_diff:.2e}"
 
 
 # ---------------------------------------------------------------------------
