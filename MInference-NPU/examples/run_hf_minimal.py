@@ -182,16 +182,17 @@ def main() -> int:
                 stats={},
                 count_success=True,
             )
+            # stream_llm 已切到 hardware band+sink；命中计数挂在 _streaming_npu 上。
             _wrap_timed(
                 streaming_kernel_npu,
-                "_streaming_tilelang_npu",
+                "_streaming_npu",
                 "stream_llm",
                 pathb_restores,
                 stats={},
                 count_success=True,
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"    path-B 计数器安装失败：{exc}")
+            print(f"    sparse path 计数器安装失败：{exc}")
 
     if args.profile_branches and args.attn_type == "minference":
         try:
