@@ -1,10 +1,8 @@
 # Copyright (c) 2026
 # Licensed under The MIT License [see LICENSE for details]
 #
-# MInference-NPU 安装脚本（v1）
-# - 不构建 CUDA 扩展：上游 `csrc/vertical_slash_index.cu` 由 `backend_npu/cuda_shim.py`
-#   的纯 Python/CPU 双指针实现顶替；三种稀疏 kernel 走 `npu_fusion_attention` + bool mask。
-# - 与上游 MInference 的 setup.py 区别：去掉 CUDAExtension/cmdclass
+# MInference-NPU 安装脚本。
+# 当前工作区只保留 PR-4 TileLang path-B smoke/profiling 所需 Python 包。
 
 from setuptools import find_packages, setup
 
@@ -14,11 +12,11 @@ with open("minference/version.py", "r") as f:
 setup(
     name="minference-npu",
     version=VERSION,  # noqa: F821 — 来自 exec 注入
-    description="MInference 1.0 ported to Huawei Ascend NPU (v1)",
+    description="MInference PR-4 TileLang path-B adaptation for Huawei Ascend NPU",
     long_description=(
-        "Ascend NPU port of Microsoft MInference 1.0 long-context prefill "
-        "acceleration. Targets CANN 8.1+ / torch_npu 2.5+ / npu_fusion_attention. "
-        "v1 scope: vertical_and_slash + block_sparse + stream_llm + dense fallback."
+        "Trimmed Ascend NPU workspace for Phi-3 long-context smoke/profiling. "
+        "The active sparse paths are stream_llm and block_sparse via TileLang, "
+        "with dense as the baseline and fallback."
     ),
     author="MInference-NPU contributors",
     license="MIT",

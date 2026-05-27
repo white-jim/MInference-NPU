@@ -1,44 +1,13 @@
 # Copyright (c) 2024-2025 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 
-from .configs.model2path import LEANKPATNS, MODEL2PATH
+from .configs.model2path import MODEL2PATH
 
 
 class MInferenceConfig:
-    MINFERENCE_ATTENTION_TYPES = [
-        "minference",
-        "vllm_minference",
-        "tri_mix_minference",
-    ]
-    OTHER_ATTENTION_TYPES = [
-        # original implement
-        "hf",
-        "vllm",
-        # our custom implement
-        "dense",
-        "static",  # minference w/ static
-        "dilated1",
-        "dilated2",
-        "a_shape",
-        "tri_shape",
-        "vllm_a_shape",
-        "vllm_tri_shape",
-        "inf_llm",
-        "flexprefill",
-        "vllm_flexprefill",
-        "xattention",
-        "tri_mix",
-    ]
-    KV_TYPES = [
-        "dense",
-        "streamingllm",
-        "snapkv",
-        "pyramidkv",
-        "quest",
-        "retr_attn",
-        "kivi",
-        "leank",
-    ]
+    MINFERENCE_ATTENTION_TYPES = ["minference"]
+    OTHER_ATTENTION_TYPES = ["hf", "dense"]
+    KV_TYPES = ["dense"]
 
     def __init__(
         self,
@@ -50,10 +19,11 @@ class MInferenceConfig:
         kv_cache_cpu_device: str = "cpu",
         kv_type: str = "dense",
         is_search: bool = False,
-        attn_kwargs: dict = {},
+        attn_kwargs: dict | None = None,
         **kwargs,
     ):
         super(MInferenceConfig, self).__init__()
+        attn_kwargs = dict(attn_kwargs or {})
         attn_type, kv_type = self.update_config_type(attn_type, kv_type)
         assert (
             attn_type in self.MINFERENCE_ATTENTION_TYPES + self.OTHER_ATTENTION_TYPES
@@ -61,9 +31,6 @@ class MInferenceConfig:
         assert (
             kv_type in self.KV_TYPES
         ), f"The kv_type {kv_type} you specified is not supported."
-        print(
-            f"<---- MInference Config Detail ----> attn_type {attn_type}, kv_type {kv_type}"
-        )
         self.attn_type = attn_type
         self.config_path = self.update_config_path(config_path, model_name)
         self.model_name = model_name
@@ -75,12 +42,9 @@ class MInferenceConfig:
         self.attn_kwargs = {
             "is_search": is_search,
             "starting_layer": starting_layer,
-            "config_path": config_path,
+            "config_path": self.config_path,
             **attn_kwargs,
         }
-        if kv_type == "leank":
-            model_name = model_name.split("/")[-1]
-            self.leank_path = LEANKPATNS[model_name]
 
     def update_config_path(self, config_path: str = None, model_name: str = None):
         if self.attn_type in self.OTHER_ATTENTION_TYPES:
@@ -89,7 +53,7 @@ class MInferenceConfig:
             return config_path
         assert (
             model_name in MODEL2PATH
-        ), f"The model {model_name} you specified is not supported. You are welcome to add it and open a PR :)"
+        ), f"The model {model_name} is not registered in this trimmed workspace."
         return MODEL2PATH[model_name]
 
     def get(self, attr, default=None):

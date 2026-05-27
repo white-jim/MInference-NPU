@@ -1,31 +1,9 @@
-# Copyright (c) 2024 Microsoft
-# Copyright (c) 2026 (NPU 适配)
+# Copyright (c) 2026
 # Licensed under The MIT License [see LICENSE for details]
-"""MInference-NPU — Ascend NPU 适配版（v1）
-
-与上游 MInference 1.0 的差异：
-- v1 不构建 minference.cuda 扩展；索引展开由 backend_npu.cuda_shim 提供占位（M4 实现）
-- v1 三种稀疏分支（vertical_and_slash / block_sparse / stream_llm）在 M1 阶段全部退化为
-  backend_npu.dense_attention；M2/M3/M4 逐个替换回真稀疏 kernel
-- v1 仅支持 HF transformers + torch_npu 宿主；vLLM 集成 / KV 压缩 / 分布式（dist_ops）/
-  dilated/static/tri_shape/tri_mix/inf_llm/flexprefill/xattention 都是 v2 计划项
-"""
+"""MInference-NPU trimmed PR-4 package."""
 
 from .configs.model2path import get_support_models
-from .minference_configuration import MInferenceConfig
-from .models_patch import MInference
-from .patch import minference_patch, patch_hf
 from .version import VERSION as __version__
-
-# M2: streaming_forward 已接入真 NPU kernel（两段 npu_fusion_attention + LSE 合并）
-from .ops.streaming_kernel_npu import streaming_forward
-
-# M3: block_sparse_attention 已接入真 NPU kernel（bool mask + npu_fusion_attention sparse_mode=1）
-from .ops.block_sparse_kernel_npu import block_sparse_attention
-
-# M4: vertical_slash_sparse_attention 已接入真 NPU kernel
-# （convert_vertical_slash_indexes CPU + bool mask + npu_fusion_attention sparse_mode=1）
-from .ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention
 
 __all__ = [
     "MInference",
@@ -33,7 +11,34 @@ __all__ = [
     "minference_patch",
     "patch_hf",
     "get_support_models",
-    "vertical_slash_sparse_attention",
     "block_sparse_attention",
     "streaming_forward",
 ]
+
+
+def __getattr__(name):
+    if name == "MInference":
+        from .models_patch import MInference
+
+        return MInference
+    if name == "MInferenceConfig":
+        from .minference_configuration import MInferenceConfig
+
+        return MInferenceConfig
+    if name == "minference_patch":
+        from .patch import minference_patch
+
+        return minference_patch
+    if name == "patch_hf":
+        from .patch import patch_hf
+
+        return patch_hf
+    if name == "block_sparse_attention":
+        from .ops.block_sparse_kernel_npu import block_sparse_attention
+
+        return block_sparse_attention
+    if name == "streaming_forward":
+        from .ops.streaming_kernel_npu import streaming_forward
+
+        return streaming_forward
+    raise AttributeError(name)

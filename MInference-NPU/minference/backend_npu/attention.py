@@ -1,9 +1,9 @@
 # Copyright (c) 2026
 # Licensed under The MIT License [see LICENSE for details]
-"""昇腾 NPU 的 attention 算子薄封装层（v1）。
+"""Thin wrappers around Ascend NPU dense attention operators.
 
 把 `torch_npu` 提供的几个 attention API 包成与 MInference 内部约定一致的接口：
-  - dense_attention(q, k, v, causal=True)         —— prefill 主路径 + 三种稀疏的 dense 退化
+  - dense_attention(q, k, v, causal=True)         —— dense baseline and fallback
   - prefill_dense(q, k, v, causal=True)           —— 显式 prefill（npu_prompt_flash_attention 优先）
   - decode_dense(q, k_cache, v_cache, ...)        —— q_len=1 decode（npu_incre_flash_attention）
 
@@ -12,7 +12,6 @@
 注意：
 - 所有函数 **device-agnostic** —— 不写死 `npu:0`，device 跟随 q.device。
 - 输出 dtype 与输入一致（fp16 / bf16）；内部若需要 fp32 中间计算，由 torch_npu 算子自行决定。
-- 这一层目的是把"原 Triton kernel 调用点"逐个替换掉；M2/M3/M4 会逐步把对应分支再换回真 NPU 稀疏 kernel。
 - 不在这里做 GQA repeat_kv —— MInference 上游 forward 已经在调 kernel 前把 K/V 复制成与 Q 同 head 数，所以本层假定 num_heads == k.num_heads。
 """
 
@@ -62,9 +61,7 @@ def _eager_attention_cpu_ref(
 ) -> torch.Tensor:
     """非 NPU 设备上的纯 PyTorch 参考实现，仅用于在开发机上做语义对照。
 
-    本函数 **不应** 在生产路径被调用；它存在的意义是：M1 阶段在 CUDA / CPU 机器上
-    跑 test_dense_forward.py 时，让 dense_attention 也能给出一个合理的结果，便于检查
-    上层 patch / forward 改造是否破坏了 shape / dtype 一致性。
+    本函数 **不应** 在生产路径被调用；它只用于非 NPU 环境下的 import/smoke/unit 兜底。
     """
     in_dtype = q.dtype
     qf = q.float()
@@ -89,7 +86,7 @@ def dense_attention(
     scale: Optional[float] = None,
     causal: bool = True,
 ) -> torch.Tensor:
-    """Dense causal attention，是 M1 阶段所有稀疏分支的兜底实现。
+    """Dense causal attention for baseline and fallback paths.
 
     Args:
         q, k, v: `[B, H, S, D]`，dtype 必须一致（fp16 / bf16 推荐）。
@@ -108,10 +105,8 @@ def dense_attention(
 
     num_heads = q.size(1)
 
-    # CANN 8.1.RC1 + torch_npu 2.5.1 实测：sparse_mode=0/2 在不传 atten_mask 时
-    # 都退化为 full attention（即使 sparse_mode=2 标称 causal）。要拿到正确 causal
-    # 语义必须 sparse_mode=1 + 显式 bool atten_mask（True=masked，NPU 惯例）。
-    # 见 docs/SETUP.md §5 与 ../../docs/context_checkpoint.md。
+    # Use an explicit bool mask for causal semantics; torch_npu sparse_mode
+    # behavior has differed across CANN releases.
     if not causal:
         result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
             q,
@@ -126,8 +121,7 @@ def dense_attention(
 
     s_q = q.size(-2)
     s_k = k.size(-2)
-    # causal: 允许 j <= i + (s_k - s_q)；masked = upper triangle starting from
-    # diagonal = (s_k - s_q + 1)。与 M3/M4 kernel 的 True=masked 约定一致。
+    # causal: 允许 j <= i + (s_k - s_q)；True means masked in torch_npu.
     causal_mask = torch.ones(s_q, s_k, device=q.device, dtype=torch.bool).triu(
         diagonal=s_k - s_q + 1
     )
@@ -168,7 +162,7 @@ def prefill_dense(
     """Prefill 阶段的 dense attention。
 
     与 `dense_attention` 接口相同；保留独立名字是为了让 patch.py 里的调用点显式区分
-    "prefill 路径" 与 "稀疏分支临时退化"，便于 M5 时按 latency profile 分析。
+    "prefill 路径" 与 "稀疏分支临时退化"。
     """
     return dense_attention(q, k, v, scale=scale, causal=causal)
 

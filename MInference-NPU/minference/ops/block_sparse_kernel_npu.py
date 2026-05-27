@@ -1,22 +1,14 @@
 # Copyright (c) 2024-2025 Microsoft
-# Copyright (c) 2026 (NPU 适配 — M3 block-sparse kernel)
+# Copyright (c) 2026 (NPU adaptation)
 # Licensed under The MIT License [see LICENSE for details]
-"""Block-sparse attention — NPU v1 实现（路径 A：npu_fusion_attention + bool mask）。
+"""Block-sparse attention for the PR-4 path-B workspace.
 
 算法语义：把 KV 序列按固定 ``block_size`` 切块，每个 query block 只与得分最高的
 ``topk_blocks`` 个 key block 做 attention（因果约束：key block index ≤ query block index）。
 块得分由平均池化的 Q×K 近似计算，token 级因果约束额外施加。
 
-NPU 实现（v1 PoC，见 ``docs/migration_plan_v1.md §4`` 路径 A）：
-  1. 平均池化 Q/K → block representatives
-  2. block 级 QK 打分 + 因果 top-k 选 key blocks
-  3. 展开为 token 级 bool mask ``[B, H, S_q, S_k]``
-  4. 追加 per-token 因果约束（保证对角块内正确性）
-  5. ``npu_fusion_attention(sparse_mode=1, atten_mask=mask)``
-
-序列长度限制：mask 构建是 O(S_q × S_k)；当 ``max(S_q, S_k) > _MAX_SEQ_FOR_MASK`` 时
-退化为 dense attention 并打印 WARNING。对 128k+ 超长上下文请改用路径 B（TileLang-Ascend
-Triton kernel，见 ``docs/M3_block_sparse.md §6``）。
+主路径是 TileLang true sparse attention。保留 bool-mask NPU 实现和 PyTorch 参考，
+用于非 fp16/不可用场景的 fallback 与单测对照。
 
 非 NPU 路径：同样构建 block-sparse mask，用纯 PyTorch masked softmax 实现，作为
 测试黄金参考。两条路径共用 ``_build_block_sparse_mask``，仅 attention 计算步骤不同。
@@ -297,16 +289,21 @@ def _block_sparse_tilelang_npu(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Path B: TileLang true sparse attention for production per-head ``H==1`` calls."""
+    """Path B: TileLang true sparse attention.
+
+    The separate-Q/K/V TileLang kernel currently keeps ``heads=1, kv_group=1``.
+    To support grouped scheduling with independent per-head K/V tensors, fold
+    the selected heads into the batch dimension and run a single TileLang
+    launch for the whole group.
+    """
     if q.dtype != torch.float16:
         raise NotImplementedError("TileLang block-sparse MVP only supports fp16")
-    if q.shape[1] != 1:
-        raise NotImplementedError("TileLang block-sparse MVP is currently only wired for H==1")
-    if k.shape[1] != 1 or v.shape[1] != 1:
+    if k.shape[1] != q.shape[1] or v.shape[1] != q.shape[1]:
         raise NotImplementedError("TileLang block-sparse MVP expects repeated per-head K/V")
 
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
+    flat_B = B * H
 
     tilelang_indices = _load_sibling_module(
         "tilelang_indices_block_sparse_standalone",
@@ -317,13 +314,17 @@ def _block_sparse_tilelang_npu(
         "tilelang_sparse_attention.py",
     )
 
-    block_indices = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
+    q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)
+    k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
+    v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
+
+    block_indices = _select_block_sparse_topk_indices(q_flat, k_flat, topk_blocks, block_size)
     indices = tilelang_indices.block_indices_to_tilelang(
         block_indices,
         S_q=S_q,
         block_size_M=block_size,
         block_size_N=block_size,
-        kv_heads=H,
+        kv_heads=1,
     )
     indices = torch.where(
         (indices >= 0) & (indices < S_k),
@@ -332,7 +333,7 @@ def _block_sparse_tilelang_npu(
     ).to(device=q.device, dtype=torch.int32)
 
     kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
-        heads=H,
+        heads=1,
         dim=D,
         topk=indices.shape[-1],
         kv_group=1,
@@ -340,11 +341,11 @@ def _block_sparse_tilelang_npu(
         q_start_index_s=S_k - S_q,
     )
 
-    q_bshd = q.transpose(1, 2).contiguous()
-    k_bsgd = k.transpose(1, 2).contiguous()
-    v_bsgd = v.transpose(1, 2).contiguous()
+    q_bshd = q_flat.transpose(1, 2).contiguous()
+    k_bsgd = k_flat.transpose(1, 2).contiguous()
+    v_bsgd = v_flat.transpose(1, 2).contiguous()
     out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
-    return out_bshd.transpose(1, 2).contiguous()
+    return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +360,7 @@ def block_sparse_attention(
     topk_blocks: int,
     block_size: int = _DEFAULT_BLOCK_SIZE,
 ) -> torch.Tensor:
-    """Block-sparse causal attention（NPU v1，路径 A：npu_fusion_attention + bool mask）。
+    """Block-sparse causal attention.
 
     Args:
         q, k, v:      ``[B, H, S, D]``，已 RoPE、已 ``repeat_kv``（与上游一致）。
@@ -371,14 +372,13 @@ def block_sparse_attention(
         ``[B, H, S, D]``，与 ``q`` 同 dtype 同 device。
 
     短路 / 降级：
-    * ``max(S_q, S_k) > _MAX_SEQ_FOR_MASK``：发 WARNING，退化为 causal dense。
-      超长序列请改用 TileLang-Ascend 路径（路径 B）。
+    * fp16 NPU 输入优先走 TileLang path-B。
+    * TileLang 不适用时，短序列回退 bool-mask NPU；过长序列回退 causal dense。
     * 非 NPU 设备：走 ``_block_sparse_pytorch_ref`` 参考路径。
 
     Notes:
         head_dim 不在 ``{16,32,64,128,256,512}`` 时自动 pad 到 2 的幂，输出截回原始 head_dim。
-        与上游 ``block_sparse_flash_attention.py`` 的主要差异：
-        1. 不使用 Triton kernel；改用 npu_fusion_attention + bool mask。
+        TileLang path-B 当前仍把多 head 折叠到 batch 维；这是下一步优化重点。
         2. 入参为 ``topk_blocks``（块数绝对值），对应上游 ``top_k``。
         3. 追加 per-token 因果约束保证对角块内正确性。
     """
@@ -404,7 +404,7 @@ def block_sparse_attention(
 
     # 主路径
     if q.device.type == "npu" and _HAS_TORCH_NPU:
-        if q.shape[1] == 1 and q.dtype == torch.float16:
+        if q.dtype == torch.float16:
             try:
                 out = _block_sparse_tilelang_npu(q, k, v, topk_blocks, block_size)
             except ImportError as exc:
@@ -429,7 +429,7 @@ def block_sparse_attention(
                 warnings.warn(
                     f"block_sparse_attention: 序列长度 {S} > {_MAX_SEQ_FOR_MASK}。"
                     " bool mask 构建需 O(S²) 内存，退化为 causal dense。"
-                    " 当前 TileLang path-B 仅接入 H==1 fp16 per-head 形态。",
+                    " 当前 TileLang path-B 仅接入 fp16 形态。",
                     stacklevel=2,
                 )
                 from ..backend_npu import dense_attention

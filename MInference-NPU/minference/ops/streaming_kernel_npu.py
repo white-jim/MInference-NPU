@@ -1,7 +1,7 @@
 # Copyright (c) 2024-2025 Microsoft
-# Copyright (c) 2026 (NPU 适配 — M2 streaming kernel)
+# Copyright (c) 2026 (NPU adaptation)
 # Licensed under The MIT License [see LICENSE for details]
-"""Streaming (A-shape) attention — NPU v1 实现。
+"""Streaming (A-shape) attention for the PR-4 path-B workspace.
 
 把上游 MInference 1.0 `ops/streaming_kernel.py:streaming_forward` 从 Triton/CUDA 移植
 到昇腾 NPU 上。算法语义：每个 query 位置 ``i`` 在 K 中的可见集合为：
@@ -10,21 +10,8 @@
 * **sliding**: ``K[..., i_abs - n_local + 1 : i_abs + 1, :]`` — 以当前 query 绝对位置
   为右端、宽 ``n_local`` 的滑动窗口（``i_abs = k_len - q_len + i``）
 
-NPU 实现路径（v1 PoC，与 `docs/migration_plan_v1.md §4` 一致）：
-
-* **段 1** — sliding-window-only：``npu_fusion_attention(sparse_mode=1, atten_mask=...)``，
-  显式 ``[1,1,S_q,S_k]`` bool mask 表达 sliding window（``True=屏蔽``）。
-  历史上想用 ``sparse_mode=4 + pre/next_tockens`` 的 band 快路径，但 CANN 8.1.RC1
-  下 sparse_mode=2/4 实测均不生效（退化成 full attention，见 docs §9.1/§9.3），
-  v1 全部 causal/band 调用走 sparse_mode=1 + 显式 mask。
-* **段 2** — sink-only：仅前 ``n_init`` 个 key，用自定义 ``atten_mask`` 排除 sliding
-  window 已经覆盖到的位置（complement-sliding-window 思路；mask 形状
-  ``[1, 1, S_q, n_init]``，n_init=128 时内存可忽略）。
-* **合并** — 跨段 log-sum-exp，用 ``npu_fusion_attention`` 返回的 ``softmax_max`` /
-  ``softmax_sum`` 做 online softmax 合并，等价完整 softmax。
-
-非 NPU 路径（CPU / CUDA / 无 torch_npu）：纯 PyTorch 黄金参考（按 q 分块构造 sink+
-sliding mask）。两条路径接口签名一致，测试用 PyTorch ref 做对照。
+主路径是 TileLang true sparse attention。保留 bool-mask NPU 实现和 PyTorch 参考，
+用于 TileLang 不适用场景的 fallback 与单测对照。
 
 短路情形：
 
@@ -233,7 +220,7 @@ def _streaming_npu(
     n_init: int,
     n_local: int,
 ) -> torch.Tensor:
-    """NPU 路径（v1）：两段 `npu_fusion_attention` + log-sum-exp 合并。
+    """Bool-mask NPU fallback: two `npu_fusion_attention` passes plus LSE merge.
 
     本函数假定调用前已经：
 
@@ -250,8 +237,7 @@ def _streaming_npu(
     scale = 1.0 / math.sqrt(head_d)
 
     # --- 段 1：sliding window only（sparse_mode=1 + 显式 bool mask） ---
-    # §9.1 实测：CANN 8.1.RC1 下 sparse_mode=2/4 不按文档语义生效（退化成 full
-    # attention），唯一可靠的稀疏路径是 sparse_mode=1 + 用户显式 atten_mask。
+    # Use sparse_mode=1 with an explicit user mask for stable semantics across CANN versions.
     # sliding 语义：query i 看 [i_abs - n_local + 1, i_abs]，i_abs = s_k - s_q + i。
     abs_i = torch.arange(s_k - s_q, s_k, device=q.device)  # [s_q]
     j_all = torch.arange(s_k, device=q.device)  # [s_k]
@@ -364,12 +350,16 @@ def _streaming_tilelang_npu(
     n_init: int,
     n_local: int,
 ) -> torch.Tensor:
-    """Path B: TileLang true sparse A-shape attention for per-head ``H==1`` calls."""
+    """Path B: TileLang true sparse A-shape attention.
+
+    The TileLang MVP still uses ``heads=1, kv_group=1`` internally.  For
+    grouped scheduling from ``minference_forward.py`` we fold independent
+    attention heads into the batch dimension, so one TileLang launch can cover
+    all heads that share the same ``(n_init, n_local)`` parameters.
+    """
     if q.dtype != torch.float16:
         raise NotImplementedError("TileLang streaming MVP only supports fp16")
-    if q.shape[1] != 1:
-        raise NotImplementedError("TileLang streaming MVP is currently only wired for H==1")
-    if k.shape[1] != 1 or v.shape[1] != 1:
+    if k.shape[1] != q.shape[1] or v.shape[1] != q.shape[1]:
         raise NotImplementedError("TileLang streaming MVP expects repeated per-head K/V")
     if int(n_init) % _TILELANG_BLOCK_SIZE != 0 or int(n_local) % _TILELANG_BLOCK_SIZE != 0:
         raise ValueError(
@@ -379,6 +369,7 @@ def _streaming_tilelang_npu(
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
     q_start = S_k - S_q
+    flat_B = B * H
 
     tilelang_indices = _load_sibling_module(
         "tilelang_indices_streaming_standalone",
@@ -390,9 +381,9 @@ def _streaming_tilelang_npu(
     )
 
     indices = tilelang_indices.stream_llm_to_tilelang(
-        B=B,
+        B=flat_B,
         S_q=S_q,
-        kv_heads=H,
+        kv_heads=1,
         n_init=int(n_init),
         n_local=int(n_local),
         block_size_N=_TILELANG_BLOCK_SIZE,
@@ -406,7 +397,7 @@ def _streaming_tilelang_npu(
     ).to(device=q.device, dtype=torch.int32)
 
     kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
-        heads=H,
+        heads=1,
         dim=D,
         topk=indices.shape[-1],
         kv_group=1,
@@ -414,11 +405,14 @@ def _streaming_tilelang_npu(
         q_start_index_s=q_start,
     )
 
-    q_bshd = q.transpose(1, 2).contiguous()
-    k_bsgd = k.transpose(1, 2).contiguous()
-    v_bsgd = v.transpose(1, 2).contiguous()
+    q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)
+    k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
+    v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
+    q_bshd = q_flat.transpose(1, 2).contiguous()
+    k_bsgd = k_flat.transpose(1, 2).contiguous()
+    v_bsgd = v_flat.transpose(1, 2).contiguous()
     out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
-    return out_bshd.transpose(1, 2).contiguous()
+    return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
 
 
 # ----------------------------------------------------------------------------
@@ -473,9 +467,9 @@ def streaming_forward(
         out = dense_attention(q, k, v, causal=True)
         return out[..., :orig_head_d]
 
-    # 主路径：PR-4 H==1 fp16 走 TileLang 真稀疏；其他 NPU 场景保留 path-A 两段合并。
+    # 主路径：PR-4 fp16 走 TileLang 真稀疏；多 head 会折叠到 batch 维一次 launch。
     if q.device.type == "npu" and _HAS_TORCH_NPU:
-        if q.shape[1] == 1 and q.dtype == torch.float16:
+        if q.dtype == torch.float16:
             try:
                 out = _streaming_tilelang_npu(q, k, v, int(n_init), int(n_local))
             except ImportError as exc:

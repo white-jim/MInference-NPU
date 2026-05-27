@@ -1,15 +1,11 @@
 # Copyright (c) 2024-2025 Microsoft
 # Copyright (c) 2026 (NPU 适配)
 # Licensed under The MIT License [see LICENSE for details]
-"""MInference 顶层入口 —— NPU v1 简化版。
+"""Top-level MInference-NPU patch entry.
 
-与上游 `models_patch_upstream.py` 的差异：
-- 移除全部 v1 排除项的分支（dilated1/dilated2/static/a_shape/tri_shape/tri_mix/
-  inf_llm/flexprefill/xattention/vllm_*/streaming2 等）
-- 移除 KV-type 特殊参数（snapkv/pyramidkv/quest/kivi/leank/retr_attn/streamingllm 等）
-- v1 仅保留 `attn_type ∈ {"minference", "dense", "hf"}`、`kv_type ∈ {"dense"}`
-
-`MInference(...)` 实例可直接 call(model) —— 与上游 API 对称，便于把已有 HF 例子迁过来。
+This trimmed workspace is focused on PR-4 TileLang path-B for Phi-3:
+``stream_llm`` and ``block_sparse`` grouped sparse attention on Ascend NPU.
+Only ``attn_type in {"minference", "dense", "hf"}`` is kept.
 """
 
 from __future__ import annotations
@@ -18,24 +14,23 @@ import json
 import os
 
 from .minference_configuration import MInferenceConfig
-from .patch import minference_patch
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-_V1_SUPPORTED_ATTN = ("minference", "dense", "hf")
-_V1_SUPPORTED_KV = ("dense",)
+_SUPPORTED_ATTN = ("minference", "dense", "hf")
+_SUPPORTED_KV = ("dense",)
 
 
 class MInference:
-    """v1 顶层入口。
+    """Top-level patch entry for the trimmed PR-4 workspace.
 
     用法：
         from minference import MInference
         model = AutoModelForCausalLM.from_pretrained(...).to("npu:0")
         model = MInference(
             attn_type="minference",
-            model_name="meta-llama/Llama-3.1-8B-Instruct",
+            model_name="microsoft/Phi-3-mini-128k-instruct",
         )(model)
     """
 
@@ -50,14 +45,15 @@ class MInference:
         attn_kwargs: dict | None = None,
         **kwargs,
     ):
-        if attn_type not in _V1_SUPPORTED_ATTN:
+        if attn_type not in _SUPPORTED_ATTN:
             raise ValueError(
-                f"attn_type='{attn_type}' is v1 排除项。v1 仅支持 {_V1_SUPPORTED_ATTN}。"
+                f"attn_type={attn_type!r} is outside the trimmed PR-4 scope. "
+                f"Use one of {_SUPPORTED_ATTN}."
             )
-        if kv_type not in _V1_SUPPORTED_KV:
+        if kv_type not in _SUPPORTED_KV:
             raise ValueError(
-                f"kv_type='{kv_type}' is v1 排除项。v1 仅支持 {_V1_SUPPORTED_KV}（"
-                "snapkv/pyramidkv/quest/kivi/retr_attn/leank/streamingllm 都在 v2 计划）。"
+                f"kv_type={kv_type!r} is outside the trimmed PR-4 scope. "
+                f"Use one of {_SUPPORTED_KV}."
             )
 
         self.config = MInferenceConfig(
@@ -65,7 +61,7 @@ class MInference:
             model_name=model_name,
             config_path=config_path,
             starting_layer=starting_layer,
-            kv_cache_cpu=False,  # v1 不支持 CPU offload
+            kv_cache_cpu=False,
             kv_type=kv_type,
             is_search=is_search,
             attn_kwargs=attn_kwargs or {},
@@ -90,8 +86,8 @@ class MInference:
                 with open(self.config.config_path, "r") as f:
                     self.config.attn_kwargs.setdefault("best_pattern", json.load(f))
 
-        # attn_type == "dense" 与 "minference" 共用 minference_patch；区别在 forward 内部：
-        # - "minference" 按 best_pattern 走 per-head 调度（M2/M3/M4 真稀疏 kernel）
-        # - "dense" 跳过 per-head 调度与索引构造，直接 backend_npu.dense_attention，
-        #   用作精度基线；attn_type 通过 model.config.minference_attn_type 注入。
+        # "dense" and "minference" share the same patch.  The forward path
+        # selects dense baseline or best-pattern grouped scheduling.
+        from .patch import minference_patch
+
         return minference_patch(model, self.config)

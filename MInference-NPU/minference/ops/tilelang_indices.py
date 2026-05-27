@@ -27,7 +27,7 @@ GQA 注意事项：
   时，同一 KV head 下的 4 个 Q head **必须**共享同一 Indices 行。MInference 上游
   对 GQA 通常采用 "Q head 内部各自打分但 KV 只算一份" 的实现，无法直接映射。
 
-  v1 (PR-4-tl-BS) MVP 只支持 MHA（``H == n_kv_heads``）；GQA 留 v2，需要先做
+  当前 PR-4 MVP 只支持 MHA（``H == n_kv_heads``）；GQA 需要先做
   per-group union 或 reuse 设计。MHA 检查在 ``_assert_mha`` 里集中处理。
 """
 
@@ -54,7 +54,7 @@ def _assert_mha(H: int, kv_heads: int, context: str) -> None:
     if H != kv_heads:
         raise NotImplementedError(
             f"{context}: 检测到 H={H} != kv_heads={kv_heads}（GQA）。"
-            " PR-4-tl-BS MVP 仅支持 MHA。GQA 留 v2。"
+            " 当前 PR-4 MVP 仅支持 MHA。"
         )
 
 
