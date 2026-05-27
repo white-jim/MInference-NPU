@@ -1,5 +1,0 @@
-evaluate
-jieba
-nltk
-rouge
-rouge_score

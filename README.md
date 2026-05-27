@@ -1,90 +1,48 @@
 # MInference-NPU
 
-将微软 [MInference 1.0](https://github.com/microsoft/MInference) 的长上下文稀疏注意力推理加速方案，迁移到华为昇腾 NPU（Ascend 910B 系列）。
+当前工作区只保留 PR-4 方向：在 Ascend NPU 上验证并优化 Phi-3 的 TileLang path-B 稀疏注意力。
 
-> **状态**：v1 代码侧 M0–M4 全部完成（dense 链路 + 三种稀疏 kernel 全部接入），两轮代码审查与 bug 修复已清完；下一步 M5 端到端实机联调与精度/性能报告。详见 [`docs/migration_plan_v1.md`](docs/migration_plan_v1.md) 与 [`docs/context_checkpoint.md`](docs/context_checkpoint.md)。
+## 当前目标
 
----
+- 只聚焦 `stream_llm` 和 `block_sparse`。
+- 用 Phi-3-mini-128k-instruct 做 4K/8K/16K 短阶梯验证。
+- 速度必须始终和 `--attn-type dense` baseline 对比。
+- 暂不继续扩到 128K/256K，直到短长度下的端到端瓶颈清楚。
 
-## 仓库结构
+## 目录
 
-```
-.
-├── MInference/          # 上游 microsoft/MInference 源码（vendored 副本，MIT）
-├── MInference-NPU/      # 本项目：MInference 的 NPU 适配实现
-│   ├── minference/      # NPU 版包代码
-│   │   ├── backend_npu/ # torch_npu / triton-ascend 后端
-│   │   ├── modules/     # patch 后的 attention forward
-│   │   ├── ops/         # 稀疏算子（M2-M4 逐步替换）
-│   │   └── configs/     # best_pattern JSON（沿用上游）
-│   ├── tests/           # 烟测与回归测试
-│   ├── examples/        # 最小可运行 HF demo
-│   └── docs/            # 阶段性实现说明（M0、M1、…）
-└── docs/                # 迁移方案与调研
-    ├── ascend_migration_survey.md   # 昇腾生态调研
-    ├── migration_plan_v1.md         # v1 迁移方案（拍板版）
-    ├── MInference_1.0_implementation.md  # 上游实现拆解
-    └── context_checkpoint.md        # 工作状态检查点
+```text
+MInference-NPU/                 # 代码仓库
+  minference/                   # NPU patch 与算子
+  benchmarks/                   # Phi3 probe config 生成、kernel benchmark
+  examples/run_hf_minimal.py    # HF smoke / 分支计时入口
+  docs/                         # 只保留当前路线文档
+docs/context_checkpoint.md      # 短上下文检查点
 ```
 
----
+完整上游副本、早期迭代文档和历史日志已删除。删除前备份位于：
 
-## v1 范围与约束
+```text
+/data/guoshiyao/zhw/MInference-NPU_backup_20260527_122449.tar.gz
+```
 
-参见 [`docs/migration_plan_v1.md`](docs/migration_plan_v1.md)。要点：
-
-- **算子主路径**：`triton-ascend`（与 `torch_npu` 2.6 配套），dense fallback 走 `torch_npu.npu_fusion_attention`
-- **框架宿主**：HuggingFace transformers ≥ 4.45（暂不集成 vLLM）
-- **稀疏分支**：v1 仅迁 `vertical_and_slash` / `block_sparse` / `stream_llm` 三种，其余（dilated / static / tri_shape / inf_llm / flexprefill / xattention）列入 v2
-- **不依赖**：`flash-attn` / `sgl_kernel` / `vllm_flash_attn`（NPU 上不可用，import 处均加 try-except 守护）
-
-里程碑：
-
-| 阶段 | 目标 | 状态 |
-|---|---|---|
-| M0 | 环境与依赖（CANN 8.3.RC1 + torch_npu 2.6.0.RC1 + triton-ascend），`tests/test_env.py` PASS | 代码与文档就绪，待实机验证 |
-| M1 | 上层 Python 链路打通，三种稀疏分支全部退化为 dense fallback 跑通 HF 推理 | 完成 |
-| M2 | `stream_llm` 真稀疏 kernel（两段 `npu_fusion_attention` + LSE 合并） | 完成 |
-| M3 | `block_sparse` 真稀疏 kernel（mean-pool + block top-k + token mask） | 完成 |
-| M4 | `vertical_and_slash` 真稀疏 kernel + 索引展开（CPU Python 双指针 + cumsum mask） | 完成 |
-| M5 | 端到端实机联调：精度对照 / 性能基准 / 长上下文效果 | 未开始（待 NPU 机器） |
-
----
-
-## 快速开始
-
-完整步骤见 [`MInference-NPU/docs/SETUP.md`](MInference-NPU/docs/SETUP.md)。简要：
+## 快速命令
 
 ```bash
-# 在已装好 Ascend HDK + CANN 8.3.RC1 的目标机上
-conda create -n minference-npu python=3.10 -y
-conda activate minference-npu
-
-pip install torch==2.6.0
-pip install torch_npu==2.6.0.RC1 -i <昇腾社区 wheel 镜像>
-pip install triton-ascend
-pip install transformers>=4.45 accelerate>=0.28
-
-cd MInference-NPU
-pip install -e .
-
-# 烟测
-python tests/test_env.py
+cd /data/guoshiyao/zhw/MInference-NPU/MInference-NPU
+source ~/ascend/cann/8.5.0/cann-8.5.0/set_env.sh
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python examples/run_hf_minimal.py \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_stream_llm_aligned_dense_others.json \
+  --ctx-len 4096 \
+  --max-new-tokens 1 \
+  --attn-type minference \
+  --profile-branches \
+  --num-runs 2
 ```
 
----
+## 最新结论
 
-## 与上游 MInference 的关系
-
-`MInference/` 目录是 microsoft/MInference 仓库的**完整源码副本**（vendored），便于和适配实现 diff 对照、且无需依赖网络拉取。本项目对上游代码**只读不改**；所有 NPU 适配新增/替换都集中在 `MInference-NPU/` 目录下。
-
-- 上游版本快照：MInference 1.0（vendored at 2026-05-23）
-- 上游协议：MIT（见 [`MInference/LICENSE`](MInference/LICENSE)）
-- 上游论文 / 项目：<https://github.com/microsoft/MInference>
-
----
-
-## 协议
-
-- `MInference/` 子目录沿用上游 MIT 协议（版权归 Microsoft Corporation，见该目录下 `LICENSE`）
-- 本仓库其余部分（`MInference-NPU/`、`docs/`、根目录文件）若无另行声明，按 MIT 发布
+- Phi3 probe path-B 可以命中，43 个目标 heads 会聚合为 6 次 grouped TileLang 调用。
+- Dense baseline 明显更快：4K dense 约 `0.60s`。
+- Clean probe steady-state 仍慢：stream 4K 第二轮约 `4.50s`，block 约 `3.50s`。
+- 下一步应优化 grouped TileLang wrapper/kernel，而不是继续加长上下文测试。
