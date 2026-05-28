@@ -1,6 +1,6 @@
 # Context Checkpoint
 
-Last update: 2026-05-28（夜 — 加 layer-range / topk config 生成器；run_hf_minimal 加 sparse vs dense quality probe + 日志目录）
+Last update: 2026-05-28（深夜 — Tier 1 MH TileLang kernel；wrapper 取消 fold-into-batch；E2E quality 横扫降级，回到算法迁移 + 速度路线）
 
 ## Current Direction
 
@@ -27,6 +27,126 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python <cmd>
 Local model：`/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 
 `PYTHONPATH` 里的 `~/tilelang-ascend` 现在只为 `block_sparse` 需要；stream_llm 路径已不依赖 TileLang。
+
+## 本轮进展（2026-05-28 深夜 — Tier 1 MH TileLang kernel + 路线收回）
+
+### 方向纠正（重要）
+
+E2E quality 横扫被降级。原因：
+
+- 项目使命是 **block_sparse 算法迁移 + 速度 + 合理精度**，不是端到端寻找最佳 layer/topk。
+- 精度通过单元测试（NPU vs PyTorch ref）守底，已有 39 passed。
+- 端到端精度下降在"所有 head 都强转 block_sparse"的配置上**必然发生**，因为 block_sparse 不是大多数 head 的最佳 pattern。这是 best_pattern 上游的事。
+- `--save-output` / `--compare-to` / `--offline-compare` / `--prompt-file` 等工具保留，仅作可选 sanity check，不再作里程碑验收。
+
+实测发现的回归（用 Alice in Wonderland 真实文本 prompt，下面这组数据催生路线收回）：
+
+| metric | layers8-13 topk1 / 32K real prompt |
+|---|---:|
+| dense run2 | 6.50s |
+| sparse run2 | 6.60s（输 1.5%） |
+| token greedy match | 4/32（12.5%） |
+| ref-mass covered | 0.1755 |
+
+这说明 layers8-13 全 heads topk1 之前的 "32K 小幅赢 dense" 数字是 prompt 退化导致的虚假胜利，不是稳态。算法迁移路线下不应纠结这种配置，应该让 best_pattern 自然分配 sparse / dense 比例。
+
+### Tier 1 MH TileLang kernel（本轮主代码改动）
+
+**动机**：当前 wrapper 把 ``B×H`` 折到 batch 维 + ``head_chunk=8`` 切分，导致 layers8-13 single layer 一次 sparse forward 触发 4 次 kernel call。每次 call 携带 Python 端 reshape / contiguous / JIT lookup / NPU stream sync。32K 实测 48 calls × 346ms = 16.6s，其中 wrapper + launch 开销有相当部分。
+
+**改动**：
+
+- `minference/ops/tilelang_sparse_attention_h1.py`
+  - 新增 `build_sparse_attention_mh_block_index_fwd(...)`。
+  - 输入 `q/k/v [B, S, H, D]`、`block_indices [B, n_q_blocks, H, topk_blocks]`，输出 `[B, S, H, D]`。
+  - 工作单元分解 `pid = b*H*q_tiles + h*q_tiles + tile_i`；每个 work item 仍处理 16 query token × 1 head，cube/vector pipeline 与 H=1 block-index 完全一致，仅索引带上 H 维。
+  - cache key 带 `mh_block_index` 前缀避免与 H=1 cache 冲突。
+- `minference/ops/block_sparse_kernel_npu.py`
+  - `_block_sparse_tilelang_npu` 默认先走 MH path。新增 `_should_use_tilelang_mh_block_index()`：依赖 H=1 block-index 安全边界 + 没被 `MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0` 显式关闭。
+  - MH path：`q/k/v` 直接 BHSD → BSHD permute 一次，不再 fold-into-batch；indices `[B, H, n_q_blocks, topk]` → `[B, n_q_blocks, H, topk]`。
+  - 回退路径：MH 不启用时走原 H=1 fold-into-batch，再不行走旧 padded-H kernel。
+- `tests/test_tilelang_sparse_attention_h1.py`
+  - 新增 `mh-h2-one-block`、`mh-h4-two-block`、`mh-h8-one-block` isolated case。每个 head 选不同 K block 子集，确保 MH path 正确处理 per-head sparse pattern。
+- `tests/test_block_sparse_kernel.py`
+  - 新增 3 个策略测试：MH 默认启用、`MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0` 强制回退、关 block-index 时 MH 也不启用（依赖关系）。
+- `benchmarks/bench_tilelang_h1_sparse_attention.py`
+  - 新增 `--mh-heads` / `--mh-head-chunks` 参数。`run_mh_vs_h1_case` 直接对比 MH 一次 launch vs H=1 fold-into-batch（含 head_chunk 多次 launch）。
+
+**Tier 1 期望收益**：
+
+- 单层 sparse forward kernel-call 数从 4 降到 1（layers8-13 topk1 配置下，per layer per run），48 → 12 calls 数量级。
+- 估算 1-3s / 32K run 的 Python wrapper 开销节省。
+- cube/vector 实际计算时间不变（每个 work item 内部完全一致）。
+- 若 wrapper 开销不是主导项，Tier 1 收益小；这就需要 Tier 2（cube 内跨 head 批处理）。
+
+**没动**：
+
+- `_block_sparse_head_chunk_size()` 默认仍 8。MH path 下用 `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0` 单独打开"一次 launch 全 H"，避免改默认值影响别处。
+- stream_llm 路径完全没动。
+- best_pattern 调度逻辑没动。
+
+### 验证
+
+- `python -m py_compile minference/ops/tilelang_sparse_attention_h1.py minference/ops/block_sparse_kernel_npu.py tests/test_tilelang_sparse_attention_h1.py tests/test_block_sparse_kernel.py benchmarks/bench_tilelang_h1_sparse_attention.py`：全部通过。
+- 服务器侧待跑（命令见下）。
+
+### 服务器端待跑命令
+
+按以下顺序执行；任何一步失败就回退 `MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0` 用旧路径。
+
+```bash
+# 1) isolated 数值正确性（MH path）
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  tests/test_tilelang_sparse_attention_h1.py --case all
+
+# 2) wrapper 单测回归（含 MH 策略测试）
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py -q
+
+# 3) MH vs H=1 fold-into-batch isolated microbenchmark
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  benchmarks/bench_tilelang_h1_sparse_attention.py \
+  --seq-lens 4096 16384 32768 \
+  --topk-blocks 1 4 16 \
+  --dim 128 \
+  --mh-heads 8 32 \
+  --mh-head-chunks 0 8
+
+# 4) HF 端到端：layers8-13 topk1 32K，A/B MH on vs off
+#    MH on (默认)
+NAME=mh_on_sparse_32k_layers8_13_topk1
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --attn-type minference \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json \
+  --ctx-len 32768 --max-new-tokens 1 --num-runs 2 --empty-cache-between-runs \
+  --device-map npu:0 --profile-branches \
+  --run-name $NAME
+
+#    MH off（强制回退到 H=1 fold-into-batch，做对照）
+NAME=mh_off_sparse_32k_layers8_13_topk1
+MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0 \
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --attn-type minference \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json \
+  --ctx-len 32768 --max-new-tokens 1 --num-runs 2 --empty-cache-between-runs \
+  --device-map npu:0 --profile-branches \
+  --run-name $NAME
+
+# 5) MH + head_chunk=0（一次 launch 全 32 heads）
+NAME=mh_on_chunk0_sparse_32k_layers8_13_topk1
+MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0 \
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --attn-type minference \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json \
+  --ctx-len 32768 --max-new-tokens 1 --num-runs 2 --empty-cache-between-runs \
+  --device-map npu:0 --profile-branches \
+  --run-name $NAME
+```
+
+对比目标：第 4/5 步的 `block_sparse: Xs over N calls` 中 `N` 应该从 48（chunk=8 + H=1 fold）降到 12（MH + chunk=0），平均每 call 时延应该相当或略升，但总 `X` 应下降。如果总 X 没降，说明 wrapper 开销不是主导项，需要进 Tier 2。
 
 ## 本轮进展（2026-05-28 夜 — 横扫 tooling + quality probe）
 

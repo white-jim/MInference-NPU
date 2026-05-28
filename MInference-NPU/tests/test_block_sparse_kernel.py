@@ -55,6 +55,7 @@ _build_block_sparse_mask = block_sparse_kernel_npu._build_block_sparse_mask
 _should_prefer_mask_npu = block_sparse_kernel_npu._should_prefer_mask_npu
 _should_use_tilelang_h1_query_block = block_sparse_kernel_npu._should_use_tilelang_h1_query_block
 _should_use_tilelang_h1_block_index = block_sparse_kernel_npu._should_use_tilelang_h1_block_index
+_should_use_tilelang_mh_block_index = block_sparse_kernel_npu._should_use_tilelang_mh_block_index
 block_sparse_attention = block_sparse_kernel_npu.block_sparse_attention
 
 try:
@@ -294,6 +295,31 @@ def test_tilelang_h1_block_index_policy_env_disable(monkeypatch):
     monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
     monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", "0")
     assert not _should_use_tilelang_h1_block_index(4096, 4096, 64)
+
+
+def test_tilelang_mh_block_index_policy_default(monkeypatch):
+    """MH path 默认启用，安全边界同 H=1 block-index。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_MH", raising=False)
+    assert _should_use_tilelang_mh_block_index(4096, 4096, 64)
+    assert not _should_use_tilelang_mh_block_index(4097, 4096, 64)
+
+
+def test_tilelang_mh_block_index_policy_env_disable(monkeypatch):
+    """MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0 强制回退 H=1 fold-into-batch。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", raising=False)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_MH", "0")
+    assert not _should_use_tilelang_mh_block_index(4096, 4096, 64)
+
+
+def test_tilelang_mh_block_index_follows_block_index_disable(monkeypatch):
+    """MH path 依赖 block-index 路径；显式关闭 block-index 时 MH 也不应启用。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", "0")
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_MH", raising=False)
+    assert not _should_use_tilelang_mh_block_index(4096, 4096, 64)
 
 
 # ---------------------------------------------------------------------------

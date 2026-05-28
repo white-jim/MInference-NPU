@@ -52,6 +52,9 @@ build_sparse_attention_h1_block_fwd = tilelang_sparse_attention_h1.build_sparse_
 build_sparse_attention_h1_block_index_fwd = (
     tilelang_sparse_attention_h1.build_sparse_attention_h1_block_index_fwd
 )
+build_sparse_attention_mh_block_index_fwd = (
+    tilelang_sparse_attention_h1.build_sparse_attention_mh_block_index_fwd
+)
 
 __test__ = False
 
@@ -196,11 +199,91 @@ def run_block_index_case(name: str, max_blocks: int, device: torch.device) -> bo
     return _compare(name, out_tl, out_ref)
 
 
+def _make_qkv_mh(device: torch.device, h_test: int):
+    torch.manual_seed(123 + h_test)
+    q = torch.randn(B, S_Q, h_test, D, dtype=torch.float16, device=device)
+    k = torch.randn(B, S_K, h_test, D, dtype=torch.float16, device=device)
+    v = torch.randn(B, S_K, h_test, D, dtype=torch.float16, device=device)
+    return q, k, v
+
+
+def _make_block_indices_mh(h_test: int, max_blocks: int) -> torch.Tensor:
+    """Per-head block indices: 每个 head 选不同的 K block 子集，覆盖 MH 路径。"""
+    n_q_blocks = S_Q // BLOCK
+    block_indices = torch.zeros(B, h_test, n_q_blocks, max_blocks, dtype=torch.int32)
+    if max_blocks == 1:
+        # head h 都选第 h % n_kb 个 K block
+        n_kb = S_K // BLOCK
+        for h in range(h_test):
+            block_indices[:, h, :, 0] = h % n_kb
+    elif max_blocks == 2:
+        n_kb = S_K // BLOCK
+        for h in range(h_test):
+            block_indices[:, h, :, 0] = h % n_kb
+            block_indices[:, h, :, 1] = (h + 1) % n_kb
+    else:
+        raise ValueError(f"unsupported max_blocks={max_blocks}")
+    return block_indices
+
+
+def run_mh_block_index_case(name: str, h_test: int, max_blocks: int, device: torch.device) -> bool:
+    print("\n" + "=" * 60)
+    print(f"[case] {name}  H={h_test}  max_blocks={max_blocks}")
+    print("=" * 60)
+
+    q, k, v = _make_qkv_mh(device, h_test)
+    block_indices_cpu = _make_block_indices_mh(h_test, max_blocks)
+    token_indices = block_indices_to_tilelang(
+        block_indices_cpu,
+        S_q=S_Q,
+        block_size_M=BLOCK,
+        block_size_N=BLOCK,
+        kv_heads=h_test,
+    ).to(device)
+    # kernel 期待 [B, n_q_blocks, H, max_blocks]
+    block_indices = block_indices_cpu.permute(0, 2, 1, 3).contiguous().to(device)
+    print(
+        f"[{name}] q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
+        f"block_indices={tuple(block_indices.shape)} topk_blocks={max_blocks} block_M={BLOCK_M}"
+    )
+
+    kernel = build_sparse_attention_mh_block_index_fwd(
+        dim=D,
+        topk_blocks=max_blocks,
+        block_M=BLOCK_M,
+        block_I=BLOCK,
+        q_start_index_s=0,
+    )
+
+    try:
+        out_tl = kernel(q, k, v, block_indices)
+    except Exception:
+        print(f"[{name}] kernel call failed:")
+        traceback.print_exc()
+        return False
+
+    out_ref = sparse_attention_qkv_reference(
+        q.cpu(),
+        k.cpu(),
+        v.cpu(),
+        token_indices.cpu(),
+        q_start_index_s=0,
+    ).to(device)
+    return _compare(name, out_tl, out_ref)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="TileLang H=1 sparse attention smoke")
+    parser = argparse.ArgumentParser(description="TileLang H=1 / MH sparse attention smoke")
     parser.add_argument(
         "--case",
-        choices=["one-block", "two-block", "all"],
+        choices=[
+            "one-block",
+            "two-block",
+            "mh-h2-one-block",
+            "mh-h4-two-block",
+            "mh-h8-one-block",
+            "all",
+        ],
         default="all",
     )
     args = parser.parse_args()
@@ -227,6 +310,18 @@ def main() -> int:
             "block-index-two-block",
             max_blocks=2,
             device=device,
+        )
+    if args.case in ("mh-h2-one-block", "all"):
+        results["mh-h2-one-block"] = run_mh_block_index_case(
+            "mh-h2-one-block", h_test=2, max_blocks=1, device=device,
+        )
+    if args.case in ("mh-h4-two-block", "all"):
+        results["mh-h4-two-block"] = run_mh_block_index_case(
+            "mh-h4-two-block", h_test=4, max_blocks=2, device=device,
+        )
+    if args.case in ("mh-h8-one-block", "all"):
+        results["mh-h8-one-block"] = run_mh_block_index_case(
+            "mh-h8-one-block", h_test=8, max_blocks=1, device=device,
         )
 
     print("\n" + "=" * 60)
