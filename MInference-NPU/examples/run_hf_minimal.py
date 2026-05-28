@@ -157,12 +157,30 @@ def main() -> int:
         default=None,
         help="便捷参数：等价于 --log-file <NAME>.log（除非 --log-file 显式给定）。",
     )
+    parser.add_argument(
+        "--offline-compare",
+        nargs=2,
+        metavar=("REF", "CUR"),
+        default=None,
+        help="离线对照模式：跳过模型加载，直接读两个 --save-output 生成的 JSON，"
+             "重新跑 quality metric（token 匹配 / top-k 命中 / ref-mass / KL）。"
+             "适合 metric 改了之后不重新 generate 就能复算。",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="从文件读 prompt 文本（UTF-8）。给定时不再用 'The quick brown fox...' 退化 prompt，"
+             "对 sparse 质量是更可信的压力测试。会按 --ctx-len 截断；不够长会拼接自身。",
+    )
     args = parser.parse_args()
 
     # --- 解析输出路径：裸文件名 → benchmarks/results/runs/<file> ---
     args.save_output = _resolve_run_path(args.save_output)
     args.compare_to = _resolve_run_path(args.compare_to)
     args.log_file = _resolve_run_path(args.log_file)
+    if args.offline_compare is not None:
+        args.offline_compare = [_resolve_run_path(Path(p)) for p in args.offline_compare]
     if args.log_file is None and args.run_name:
         args.log_file = DEFAULT_RUN_DIR / f"{args.run_name}.log"
 
@@ -176,6 +194,12 @@ def main() -> int:
         print(f"[log] tee stdout -> {args.log_file}")
 
     try:
+        if args.offline_compare is not None:
+            ref_path, cur_path = args.offline_compare
+            print(f"[offline-compare] ref = {ref_path}")
+            print(f"[offline-compare] cur = {cur_path}")
+            _compare_quality_jsons(ref_path, cur_path)
+            return 0
         return _run_with_args(args)
     finally:
         if log_handle is not None:
@@ -317,8 +341,13 @@ def _run_with_args(args: argparse.Namespace) -> int:
             print(f"    branch profiler 安装失败：{exc}")
 
     print(f"[3/4] 构造长 prompt（ctx_len={args.ctx_len}）")
-    # 构造一个简单的可重复 prompt：把一句话循环到目标 token 数
-    base = "The quick brown fox jumps over the lazy dog. " * 200
+    if args.prompt_file is not None:
+        base = args.prompt_file.read_text(encoding="utf-8")
+        print(f"    prompt source: {args.prompt_file} ({len(base)} chars)")
+    else:
+        # 简单可重复 prompt：当 quality 测试需要真实文本时用 --prompt-file 覆盖
+        base = "The quick brown fox jumps over the lazy dog. " * 200
+        print("    prompt source: built-in 'fox jumps' loop (适合 latency；质量测试请用 --prompt-file)")
     enc = tokenizer(base, return_tensors="pt", truncation=True, max_length=args.ctx_len)
     # 不足 ctx_len 就再拼，直到达到目标长度
     while enc["input_ids"].shape[1] < args.ctx_len:
@@ -461,36 +490,98 @@ def _save_quality_output(
         f.write("\n")
 
 
+def _scores_to_topk_dicts(scores, top_k: int) -> list[dict]:
+    """torch path: convert generate scores to compact JSON-friendly top-K dicts."""
+    import torch as _torch
+
+    out = []
+    for step_logits in scores:
+        v = step_logits[0].detach().float().cpu()
+        k = min(top_k, v.shape[-1])
+        topv, topi = _torch.topk(v, k=k)
+        out.append({"token_ids": topi.tolist(), "logits": topv.tolist()})
+    return out
+
+
 def _compare_quality_outputs(
     reference_path: Path,
     current_token_ids: list[int],
     current_scores,
     top_k: int,
 ) -> None:
-    import torch as _torch
-
+    """Online compare: ref from JSON, cur from in-memory generate scores."""
+    cur_per_step = _scores_to_topk_dicts(current_scores, top_k)
+    cur_tokens = [int(t) for t in current_token_ids]
     with reference_path.open() as f:
         ref = json.load(f)
-    ref_meta = ref.get("metadata", {})
-    ref_tokens = ref["generated_token_ids"]
-    ref_per_step = ref["per_step_top_k"]
+    _report_quality(
+        ref_meta=ref.get("metadata", {}),
+        ref_tokens=ref["generated_token_ids"],
+        ref_per_step=ref["per_step_top_k"],
+        cur_meta=None,
+        cur_tokens=cur_tokens,
+        cur_per_step=cur_per_step,
+        reference_path=reference_path,
+    )
 
-    cur_tokens = [int(t) for t in current_token_ids]
-    cur_per_step = []
-    for step_logits in current_scores:
-        v = step_logits[0].detach().float().cpu()
-        k = min(top_k, v.shape[-1])
-        topv, topi = _torch.topk(v, k=k)
-        cur_per_step.append(
-            {
-                "token_ids": topi.tolist(),
-                "logits": topv.tolist(),
-            }
-        )
 
+def _compare_quality_jsons(ref_path: Path, cur_path: Path) -> None:
+    """Offline compare：两个 --save-output 生成的 JSON 直接对照，不需要 torch / NPU。"""
+    with ref_path.open() as f:
+        ref = json.load(f)
+    with cur_path.open() as f:
+        cur = json.load(f)
+    _report_quality(
+        ref_meta=ref.get("metadata", {}),
+        ref_tokens=ref["generated_token_ids"],
+        ref_per_step=ref["per_step_top_k"],
+        cur_meta=cur.get("metadata", {}),
+        cur_tokens=cur["generated_token_ids"],
+        cur_per_step=cur["per_step_top_k"],
+        reference_path=ref_path,
+        current_path=cur_path,
+    )
+
+
+def _softmax_safe(xs: list[float]) -> list[float]:
+    if not xs:
+        return []
+    mx = max(xs)
+    exps = [math.exp(x - mx) for x in xs]
+    s = sum(exps)
+    if s <= 0.0:
+        return [0.0] * len(exps)
+    return [e / s for e in exps]
+
+
+def _report_quality(
+    *,
+    ref_meta: dict,
+    ref_tokens: list[int],
+    ref_per_step: list[dict],
+    cur_meta: dict | None,
+    cur_tokens: list[int],
+    cur_per_step: list[dict],
+    reference_path: Path,
+    current_path: Path | None = None,
+) -> None:
+    """所有 quality metric 统一报表。online / offline 都走这里。
+
+    Metric 设计:
+    - token greedy match: greedy 解码下 sparse 和 dense 是否生成完全一致的序列。
+    - top-1 / top-5 / top-10 命中率: per-step 集合重合，反映分布主峰是否一致。
+    - ref-mass-in-cur-topk: 把 ref top-K 自己 softmax 后，落在 cur top-K 里的概率质量。
+      对 greedy 解码来说，这比 KL 更直接：1.0 = ref 主要质量都被 cur 看到；
+      0.x = ref 看重的某些候选 cur 已经丢弃了。
+    - approx KL(ref || cur) on union top-K: 缺失 token 不再 ``-inf``，而是落到
+      ``floor_logit = min(observed) - 10``，对应概率 ~e^-10 of min；这样 KL 始终有限，
+      只是会被 tail token 偏移微量放大。
+    """
     n_compare = min(len(ref_tokens), len(cur_tokens), len(ref_per_step), len(cur_per_step))
     print()
     print("    [quality] reference:", reference_path)
+    if current_path is not None:
+        print("    [quality] current:  ", current_path)
     print(
         f"    [quality] reference attn_type={ref_meta.get('attn_type')!r}, "
         f"config_path={ref_meta.get('config_path')!r}, "
@@ -498,6 +589,14 @@ def _compare_quality_outputs(
         f"max_new_tokens={ref_meta.get('max_new_tokens')}, "
         f"top_k={ref_meta.get('quality_top_k')}"
     )
+    if cur_meta is not None:
+        print(
+            f"    [quality] current   attn_type={cur_meta.get('attn_type')!r}, "
+            f"config_path={cur_meta.get('config_path')!r}, "
+            f"ctx_len={cur_meta.get('ctx_len')}, "
+            f"max_new_tokens={cur_meta.get('max_new_tokens')}, "
+            f"top_k={cur_meta.get('quality_top_k')}"
+        )
     print(
         f"    [quality] compare first {n_compare} steps "
         f"(ref_len={len(ref_tokens)}, cur_len={len(cur_tokens)})"
@@ -529,9 +628,10 @@ def _compare_quality_outputs(
         f"first divergence step = {first_div}"
     )
 
-    # ---- 2. top-1 / top-5 set agreement (ref-vs-cur per step) ----
+    # ---- 2. per-step top-1 / 5 / 10 set agreement ----
     top1_match = 0
     top5_overlap_sum = 0.0
+    top10_overlap_sum = 0.0
     for i in range(n_compare):
         ref_ids = ref_per_step[i]["token_ids"]
         cur_ids = cur_per_step[i]["token_ids"]
@@ -539,24 +639,47 @@ def _compare_quality_outputs(
             continue
         if ref_ids[0] == cur_ids[0]:
             top1_match += 1
-        k5 = min(5, len(ref_ids), len(cur_ids))
-        ref_set = set(ref_ids[:k5])
-        cur_set = set(cur_ids[:k5])
-        if ref_set and cur_set:
-            top5_overlap_sum += len(ref_set & cur_set) / float(k5)
+        for k_target, accum in ((5, "top5"), (10, "top10")):
+            k = min(k_target, len(ref_ids), len(cur_ids))
+            if k <= 0:
+                continue
+            ref_set = set(ref_ids[:k])
+            cur_set = set(cur_ids[:k])
+            overlap = len(ref_set & cur_set) / float(k)
+            if accum == "top5":
+                top5_overlap_sum += overlap
+            else:
+                top10_overlap_sum += overlap
     print(
         f"    [quality] per-step top-1 match: "
-        f"{top1_match}/{n_compare} "
-        f"({100.0 * top1_match / n_compare:.1f}%); "
-        f"per-step top-5 jaccard mean = "
-        f"{top5_overlap_sum / n_compare:.3f}"
+        f"{top1_match}/{n_compare} ({100.0 * top1_match / n_compare:.1f}%); "
+        f"top-5 jaccard mean = {top5_overlap_sum / n_compare:.3f}; "
+        f"top-10 jaccard mean = {top10_overlap_sum / n_compare:.3f}"
     )
 
-    # ---- 3. KL divergence on union of top-K (approx) ----
-    # Reference -> current direction: KL(P_ref || Q_cur) using union(top-K) per step.
-    # Missing tokens use logit = -inf -> prob 0; safe because we take union.
-    kl_sum = 0.0
-    kl_n = 0
+    # ---- 3. ref-mass-in-cur-topk (用 ref 自己的 softmax 度量) ----
+    mass_sum = 0.0
+    mass_n = 0
+    for i in range(n_compare):
+        ref_ids = ref_per_step[i]["token_ids"]
+        ref_logits = ref_per_step[i]["logits"]
+        cur_ids_set = set(cur_per_step[i]["token_ids"])
+        if not ref_ids:
+            continue
+        probs = _softmax_safe(list(ref_logits))
+        covered = sum(p for tid, p in zip(ref_ids, probs) if tid in cur_ids_set)
+        mass_sum += covered
+        mass_n += 1
+    if mass_n > 0:
+        print(
+            f"    [quality] ref-mass covered by cur top-K: "
+            f"mean over {mass_n} steps = {mass_sum / mass_n:.4f} "
+            f"(1.0 = sparse 没丢任何 ref top-K 看重的候选)"
+        )
+
+    # ---- 4. approx KL(ref || cur) on union top-K，缺失 token 用 floor logit ----
+    kl_vals: list[float] = []
+    floor_offset = 10.0
     for i in range(n_compare):
         ref_ids = ref_per_step[i]["token_ids"]
         ref_logits = ref_per_step[i]["logits"]
@@ -564,42 +687,31 @@ def _compare_quality_outputs(
         cur_logits = cur_per_step[i]["logits"]
         ref_map = dict(zip(ref_ids, ref_logits))
         cur_map = dict(zip(cur_ids, cur_logits))
-        union = list(ref_map.keys() | cur_map.keys())
-        if not union:
+        union_keys = list(ref_map.keys() | cur_map.keys())
+        if not union_keys:
             continue
-        neg_inf = float("-inf")
-        ref_vec = [ref_map.get(t, neg_inf) for t in union]
-        cur_vec = [cur_map.get(t, neg_inf) for t in union]
-
-        def _softmax(xs):
-            mx = max(x for x in xs if x != neg_inf)
-            exps = [math.exp(x - mx) if x != neg_inf else 0.0 for x in xs]
-            s = sum(exps)
-            return [e / s for e in exps] if s > 0 else [0.0] * len(exps)
-
-        p = _softmax(ref_vec)
-        q = _softmax(cur_vec)
-        # KL(P||Q) = sum P log(P/Q). For p==0 contribute 0.
+        all_logits = list(ref_logits) + list(cur_logits)
+        if not all_logits:
+            continue
+        floor_logit = min(all_logits) - floor_offset
+        ref_vec = [ref_map.get(t, floor_logit) for t in union_keys]
+        cur_vec = [cur_map.get(t, floor_logit) for t in union_keys]
+        p = _softmax_safe(ref_vec)
+        q = _softmax_safe(cur_vec)
         kl = 0.0
         for pp, qq in zip(p, q):
             if pp > 0.0 and qq > 0.0:
                 kl += pp * math.log(pp / qq)
-            elif pp > 0.0 and qq == 0.0:
-                # ref mass on a token current never put in top-K: large penalty.
-                kl += float("inf")
-                break
-        if math.isfinite(kl):
-            kl_sum += kl
-            kl_n += 1
-    if kl_n > 0:
+        kl_vals.append(kl)
+    if kl_vals:
+        kl_vals_sorted = sorted(kl_vals)
+        mean_kl = sum(kl_vals) / len(kl_vals)
+        median_kl = kl_vals_sorted[len(kl_vals_sorted) // 2]
+        max_kl = kl_vals_sorted[-1]
         print(
-            f"    [quality] approx KL(ref||cur) on top-{top_k} union: "
-            f"mean over {kl_n}/{n_compare} steps = {kl_sum / kl_n:.4f} nats"
-        )
-    else:
-        print(
-            "    [quality] KL: 所有比较步都出现 ref top-K token 不在 cur top-K，"
-            "KL = +inf；说明 sparse vs dense 分布偏移很大。"
+            f"    [quality] approx KL(ref||cur), floor=min-{floor_offset:g}: "
+            f"mean={mean_kl:.4f} nats over {len(kl_vals)} steps, "
+            f"median={median_kl:.4f}, max={max_kl:.4f}"
         )
 
 
