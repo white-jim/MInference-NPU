@@ -425,6 +425,7 @@ def _block_sparse_tilelang_npu(
         v_bshd = v.permute(0, 2, 1, 3).contiguous()
         kernel = tilelang_sparse_attention_h1.build_sparse_attention_mh_block_index_fwd(
             dim=D,
+            heads=H,
             topk_blocks=block_indices_bnht.shape[-1],
             block_M=_TILELANG_H1_BLOCK_M,
             block_I=block_size,

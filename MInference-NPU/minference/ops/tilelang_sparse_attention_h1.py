@@ -686,6 +686,7 @@ def build_sparse_attention_h1_block_index_fwd(
 def build_sparse_attention_mh_block_index_fwd(
     *,
     dim: int,
+    heads: int,
     topk_blocks: int,
     sm_scale: float | None = None,
     block_M: int = 16,
@@ -704,10 +705,16 @@ def build_sparse_attention_mh_block_index_fwd(
       * ``k``/``v``: ``[B, S_k, H, D]``  (MHA only; ``H_kv = H`` for this MVP)
       * ``block_indices``: ``[B, n_q_blocks, H, topk_blocks]``
 
+    ``heads`` 是 **compile-time** 参数（不是 symbolic），原因：
+    早期把 ``heads`` 作为 symbolic 时，``q_tiles * heads * batch`` 的三层符号相乘 +
+    modulo 让 Ascend kernel 出现全 NaN 输出（isolated smoke 4/4 MH cases 全失败）。
+    改为 compile-time int 后 stride 与 work unit 分解都是编译期常量，且 ``cache_key``
+    带上 ``heads`` 实现按 H 分别 JIT，运行时小开销。
+
     Differences vs ``build_sparse_attention_h1_block_index_fwd``:
       * 不再依赖 wrapper 把 ``B*H`` 折到 batch 维。kernel 直接接 BSHD 自然形态。
-      * 工作单元分解为 ``(b, h, q_tile)``，分别 = ``pid // (H*q_tiles)``、
-        ``(pid // q_tiles) % H``、``pid % q_tiles``。
+      * 工作单元分解为 ``(b, h, q_tile)``，``q_tiles*heads`` 在 JIT 期已是 ``int*symbolic``，
+        不会出现 symbolic*symbolic 的多层嵌套。
       * cube/vector pipeline 与 H=1 block-index kernel 完全一致；每个 work item
         仍处理 ``block_M=16`` query token × 1 head。这一版只解 wrapper 侧的
         fold-into-batch + head_chunk 开销；后续若需进一步把多 head 堆到一次 cube
@@ -720,6 +727,8 @@ def build_sparse_attention_mh_block_index_fwd(
         raise ValueError(f"dim={dim} must be a power of two")
     if topk_blocks <= 0:
         raise ValueError(f"topk_blocks={topk_blocks} must be positive")
+    if heads <= 0:
+        raise ValueError(f"heads={heads} must be positive")
     if block_M % 2 != 0 or block_M < 16:
         raise ValueError("block_M must be even and at least 16 for Ascend vector lanes")
     if block_I % block_M != 0:
@@ -728,6 +737,7 @@ def build_sparse_attention_mh_block_index_fwd(
     cache_key = (
         "mh_block_index",
         dim,
+        heads,
         topk_blocks,
         sm_scale,
         block_M,
@@ -753,6 +763,7 @@ def build_sparse_attention_mh_block_index_fwd(
     @tilelang.jit(out_idx=[4], workspace_idx=[5, 6, 7, 8, 9], pass_configs=pass_configs)
     def _kernel_factory(
         dim,
+        heads,
         topk_blocks,
         sm_scale=None,
         block_M=16,
@@ -766,12 +777,13 @@ def build_sparse_attention_mh_block_index_fwd(
         seq_len = T.symbolic("seq_len")
         seq_len_kv = T.symbolic("seq_len_kv")
         q_blocks = T.symbolic("q_blocks")
-        heads = T.symbolic("heads")
+        # ``heads`` 是闭包外的 compile-time int，下面 shape / 工作单元都用 int 字面量参与。
+        H = heads
 
-        q_shape = [batch, seq_len, heads, dim]
-        kv_shape = [batch, seq_len_kv, heads, dim]
-        block_indices_shape = [batch, q_blocks, heads, topk_blocks]
-        o_shape = [batch, seq_len, heads, dim]
+        q_shape = [batch, seq_len, H, dim]
+        kv_shape = [batch, seq_len_kv, H, dim]
+        block_indices_shape = [batch, q_blocks, H, topk_blocks]
+        o_shape = [batch, seq_len, H, dim]
 
         BM = block_M
         BI = block_I
@@ -823,13 +835,13 @@ def build_sparse_attention_mh_block_index_fwd(
                 mask_ub = T.alloc_ub([BI // 8], "uint8")
 
                 q_tiles = T.ceildiv(seq_len, BM)
-                bh_tiles = q_tiles * heads
+                bh_tiles = q_tiles * H  # int * symbolic → symbolic（同 H=1 的 q_tiles * batch）
                 total_tiles = bh_tiles * batch
                 for core_index in T.serial(T.ceildiv(total_tiles, core_num)):
                     pid = core_index * core_num + cid
                     if pid < total_tiles:
                         tile_i = pid % q_tiles
-                        h_i = (pid // q_tiles) % heads
+                        h_i = (pid // q_tiles) % H
                         b_i = pid // bh_tiles
                         s_base = tile_i * BM
                         q_block_i = s_base // BI
@@ -1000,6 +1012,7 @@ def build_sparse_attention_mh_block_index_fwd(
 
     kernel = _kernel_factory(
         dim=dim,
+        heads=heads,
         topk_blocks=topk_blocks,
         sm_scale=sm_scale,
         block_M=block_M,

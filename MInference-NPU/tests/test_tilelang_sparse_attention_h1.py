@@ -249,6 +249,7 @@ def run_mh_block_index_case(name: str, h_test: int, max_blocks: int, device: tor
 
     kernel = build_sparse_attention_mh_block_index_fwd(
         dim=D,
+        heads=h_test,
         topk_blocks=max_blocks,
         block_M=BLOCK_M,
         block_I=BLOCK,

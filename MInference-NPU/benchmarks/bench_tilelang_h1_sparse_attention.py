@@ -249,6 +249,7 @@ def run_mh_vs_h1_case(
 
     mh_kernel = build_sparse_attention_mh_block_index_fwd(
         dim=dim,
+        heads=heads,
         topk_blocks=topk_blocks,
         block_M=block_m,
         block_I=block_size,
