@@ -62,7 +62,9 @@ _MAX_SEQ_FOR_MASK = 16384
 # 短上下文优先走 bool-mask NPU path A，作为 4K-16K 过渡路径与 TileLang path-B
 # 的性能对照。设为 0 可强制所有 fp16 NPU block_sparse 先尝试 TileLang。
 _PREFER_MASK_MAX_SEQ_ENV = "MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ"
+_PREFER_MASK_MAX_HEADS_ENV = "MINFERENCE_BLOCK_SPARSE_MASK_MAX_HEADS"
 _DEFAULT_PREFER_MASK_MAX_SEQ = 16384
+_DEFAULT_PREFER_MASK_MAX_HEADS = 16
 
 # TileLang path-B 默认使用 H=1 query-block kernel。设为 0 可回到旧 padded-H kernel，
 # 便于做 A/B benchmark 或快速规避新 kernel 的边界问题。
@@ -110,8 +112,26 @@ def _preferred_mask_max_seq() -> int:
         return _DEFAULT_PREFER_MASK_MAX_SEQ
 
 
-def _should_prefer_mask_npu(seq_len: int) -> bool:
-    return seq_len <= min(_MAX_SEQ_FOR_MASK, _preferred_mask_max_seq())
+def _preferred_mask_max_heads() -> int:
+    raw = os.environ.get(_PREFER_MASK_MAX_HEADS_ENV)
+    if raw is None or raw == "":
+        return _DEFAULT_PREFER_MASK_MAX_HEADS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        warnings.warn(
+            f"{_PREFER_MASK_MAX_HEADS_ENV}={raw!r} 不是合法整数；"
+            f"回退默认值 {_DEFAULT_PREFER_MASK_MAX_HEADS}。",
+            stacklevel=2,
+        )
+        return _DEFAULT_PREFER_MASK_MAX_HEADS
+
+
+def _should_prefer_mask_npu(seq_len: int, num_heads: int = 1) -> bool:
+    return (
+        seq_len <= min(_MAX_SEQ_FOR_MASK, _preferred_mask_max_seq())
+        and num_heads <= _preferred_mask_max_heads()
+    )
 
 
 def _should_use_tilelang_h1_query_block(seq_len_q: int, seq_len_k: int, block_size: int) -> bool:
@@ -171,7 +191,7 @@ def _select_block_sparse_topk_indices(
     scores.masked_fill_(~causal_block[None, None], float("-inf"))
 
     topk = min(topk_blocks, n_bk)
-    return torch.topk(scores, topk, dim=-1).indices  # [B, H, n_bq, topk]
+    return torch.topk(scores, topk, dim=-1).indices.sort(dim=-1).values  # [B, H, n_bq, topk]
 
 
 def _build_block_sparse_mask(
@@ -332,6 +352,23 @@ def _load_sibling_module(module_name: str, filename: str):
     return module
 
 
+def _set_current_npu_device_for(tensor: torch.Tensor) -> str | None:
+    """Align torch_npu's current device with the tensor before TileLang JIT/call.
+
+    TileLang callables are compiled and launched against the current NPU
+    context. In HF ``device_map=auto`` runs different layers may live on
+    different NPU devices, so the Python kernel cache must also be keyed by
+    device to avoid reusing an npu:0 callable on npu:1 tensors.
+    """
+    if tensor.device.type != "npu" or not hasattr(torch, "npu"):
+        return None
+    device_index = tensor.device.index
+    if device_index is None:
+        return None
+    torch.npu.set_device(device_index)
+    return f"npu:{device_index}"
+
+
 def _block_sparse_tilelang_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -354,6 +391,7 @@ def _block_sparse_tilelang_npu(
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
     flat_B = B * H
+    cache_device = _set_current_npu_device_for(q)
 
     q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)
     k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
@@ -380,6 +418,7 @@ def _block_sparse_tilelang_npu(
             block_M=_TILELANG_H1_BLOCK_M,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
+            cache_device=cache_device,
         )
         out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, block_indices_bsh)
         return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
@@ -416,6 +455,7 @@ def _block_sparse_tilelang_npu(
             block_M=_TILELANG_H1_BLOCK_M,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
+            cache_device=cache_device,
         )
     else:
         kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
@@ -426,6 +466,7 @@ def _block_sparse_tilelang_npu(
             block_I=block_size,
             q_start_index_s=S_k - S_q,
             use_contiguous_range_load=(S_k % block_size == 0),
+            cache_device=cache_device,
         )
 
     out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
@@ -491,7 +532,7 @@ def block_sparse_attention(
     # 主路径
     if q.device.type == "npu" and _HAS_TORCH_NPU:
         if q.dtype == torch.float16:
-            if _should_prefer_mask_npu(S):
+            if _should_prefer_mask_npu(S, q.shape[1]):
                 try:
                     out = _block_sparse_npu(q, k, v, topk_blocks, block_size)
                 except Exception as exc:  # noqa: BLE001

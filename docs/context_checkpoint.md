@@ -1,13 +1,13 @@
 # Context Checkpoint
 
-Last update: 2026-05-28（中 — block-index H=1 kernel 接入，解除 all-head indices OOM，但端到端时延未赢 dense）
+Last update: 2026-05-28（晚 — 修复 TileLang 多卡 device cache，64K auto 多卡 block_sparse 稳态赢 dense）
 
 ## Current Direction
 
 PR-4 当前只关心两条真稀疏路径：
 
 - `stream_llm` —— **已重写为 hardware band + sink + LSE merge，并完成 4K-64K 验证**（不再走 TileLang）
-- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load，并新增 H=1 query-block kernel。dense-others 已改为 hardware causal band。**当前端到端瓶颈转向 block_sparse wrapper 的 token-level indices 展开与 sparse 覆盖率**
+- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load、H=1 query-block kernel、block-index H=1 kernel，并已修复 `device_map=auto` 多卡 TileLang cache/device 绑定问题。dense-others 已改为 hardware causal band。**token-level indices 展开/OOM 已解除；当前最好端到端点是 layers8-13 全 heads + topk1，在 32K 和 64K 多卡 run2 都小幅/明显超过 dense baseline**
 - 验证模型固定 Phi-3-mini-128k-instruct
 
 不要回到已删除的老路线。Backup：
@@ -27,6 +27,196 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python <cmd>
 Local model：`/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 
 `PYTHONPATH` 里的 `~/tilelang-ascend` 现在只为 `block_sparse` 需要；stream_llm 路径已不依赖 TileLang。
+
+## 本轮进展（2026-05-28 多卡修复 + 上游算子对照）
+
+### device_map=auto 多卡修复
+
+问题：
+
+- 64K + layers8-13 all heads topk1 在单卡 `npu:0` 可跑，run2 `20.00s`。
+- 同一配置在 `device_map=auto` 下触发 TileLang AICore：`MTE instruction DDR address out of range`。
+- 隔离 wrapper H=1/2/4/8/16/32 64K topk1 全部可跑，H=32 `68.51ms`，说明不是 kernel 本体或 folded-head batch 的基本边界。
+
+根因判断：
+
+- TileLang callable 的 Python cache 只按 shape/topk 等参数缓存，没有按 NPU device 缓存。
+- `device_map=auto` 下不同层在不同 NPU 上执行，可能复用第一次在 `npu:0` 编译的 callable 去跑 `npu:1` tensor。
+
+代码改动：
+
+- `minference/ops/block_sparse_kernel_npu.py`
+  - 新增 `_set_current_npu_device_for(q)`，TileLang JIT/call 前切到 `q.device`。
+  - `_block_sparse_tilelang_npu` 向 TileLang builder 传入 `cache_device="npu:{idx}"`。
+- `minference/ops/tilelang_sparse_attention_h1.py`
+  - `build_sparse_attention_h1_block_fwd` 和 `build_sparse_attention_h1_block_index_fwd` 的 cache key 纳入 `cache_device`。
+- `minference/ops/tilelang_sparse_attention.py`
+  - 旧 token-index fallback kernel cache key 也纳入 `cache_device`。
+
+验证：
+
+- `python -m py_compile minference/ops/block_sparse_kernel_npu.py minference/ops/tilelang_sparse_attention_h1.py minference/ops/tilelang_sparse_attention.py`：通过。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python -m pytest tests/test_block_sparse_kernel.py -q`：`39 passed`。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python tests/test_tilelang_sparse_attention_h1.py --case all`：PASS。
+
+64K 多卡 E2E 结果（Phi-3-mini-128k-instruct，`device_map=auto`，`max_new_tokens=1`，`--empty-cache-between-runs`）：
+
+| config | run1 | run2 | notes |
+|---|---:|---:|---|
+| dense baseline | 23.14s | 22.41s | default dense path |
+| layers8-13 all heads topk1 | 51.01s | 19.48s | 首轮含 TileLang JIT；run2 稳态赢 dense |
+
+结论：
+
+- 多卡问题已修复：64K `device_map=auto` 不再 AICore。
+- 64K 多卡稳态 sparse `19.48s` vs dense `22.41s`，约 13.1% 加速。
+- 这是比 32K 更有说服力的端到端收益点，也符合长上下文越长 sparse 越该有收益的预期。
+
+### 对照 MInference 原始 block_sparse 算子
+
+参考上游 `block_sparse_flash_attention.py` 后发现两点：
+
+- 上游会 sort top-k block indices；当前 NPU path 已改为 `.indices.sort(dim=-1).values`。
+- 上游 kernel 对早期 query block 使用 `block_count = min(q_block + 1, topk)`，避免计算不可见未来 block。
+
+尝试迁移第二点到 TileLang block-index kernel：
+
+- C/V 两侧都只处理 `i_i <= q_block_i` 的 block。
+- 数值 smoke PASS。
+- 但 wrapper benchmark 变慢：
+  - 32K topk4：`4.52ms -> 4.73ms`
+  - 32K topk16：`15.74ms -> 15.92ms`
+
+结论：
+
+- 在当前 TileLang/Ascend pipeline 下，动态分支和跨核同步损耗超过了跳过早期 future block 的收益。
+- 已回退动态 block_count 剪枝，仅保留 indices sort 和 device-aware cache。
+- 后续如果要复刻上游这部分收益，需要更深地重排 kernel pipeline，而不是简单加动态 if。
+
+## 本轮进展（2026-05-28 low-topk 覆盖点搜索）
+
+目标：从“all-head 太慢、probe 覆盖太少”之间找中间 sparse 覆盖点，直接服务端到端 latency。
+
+新增/纳入生成脚本：
+
+- `benchmarks/prepare_phi3_pathb_configs.py`
+  - 新增 layers8-13 全 heads block_sparse latency configs：
+    - `Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json`
+    - `Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk2_latency.json`
+    - `Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk4_latency.json`
+  - 这 3 个配置只把当前 probe 涉及的 8-13 层整层 32 heads 改为 block_sparse，其余层保持 dense。
+  - `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0` 下运行，依赖 block-index kernel 避免 all-head indices OOM。
+- `minference/ops/block_sparse_kernel_npu.py`
+  - 新增短序列 bool-mask path A 的 head 数保护：`MINFERENCE_BLOCK_SPARSE_MASK_MAX_HEADS`，默认 16。
+  - 原因：16K + layers8-13 all-head 配置在 `H=32` 时会尝试构造巨大 bool mask，反复 OOM 后才 fallback TileLang，导致 run2 变成 `95.97s`。
+  - 新策略：`S <= 16384` 仍可走 path A，但只有 `num_heads <= 16` 的小 head group 才默认走 mask；更大的 group 直接走 TileLang path-B。
+- `benchmarks/probe_block_sparse_heads.py`
+  - 新增隔离 head-count probe，用于定位 64K HF AICore 是否来自 kernel 本体。
+
+32K E2E 结果（Phi-3-mini-128k-instruct，`max_new_tokens=1`，比较 run2，串行单进程跑）：
+
+| config | sparse heads | topk_blocks | run2 | branch timings |
+|---|---:|---:|---:|---|
+| dense baseline（复跑） | 0 | n/a | 3.87s | n/a |
+| probe + dense-others | 43 | 16 | 4.47s | block_sparse `16.511s/18 calls`, dense `4.273s/64 calls` |
+| layers8-13 all heads | 192 | 4 | 4.29s | block_sparse `18.092s/12 calls`, dense `3.669s/52 calls` |
+| layers8-13 all heads | 192 | 2 | 3.93s | block_sparse `16.792s/12 calls`, dense `3.675s/52 calls` |
+| layers8-13 all heads | 192 | 1 | 3.74s | block_sparse `16.793s/12 calls`, dense `3.667s/52 calls` |
+
+结论：
+
+- 这是当前第一次在 32K 端到端 run2 上超过 dense baseline：`3.74s` vs dense `3.87s`，约 3.4%。
+- topk 从 2 降到 1 后，branch profiler 的 `block_sparse` 总时长几乎没变，但 run2 下降明显；说明 profiler 包含两轮/JIT/同步和重复 run 混合，不能只看 branch 累计时间判断稳态。
+- 真正有用的覆盖策略不是 all-head，也不是 43-head probe，而是“去掉部分 dense 层调用 + 低 topk 控制 sparse 计算量”。
+- 下一步应该围绕 layers8-13 topk1 做横向验证：
+  1. 测 layers8-13 topk1 的输出/质量风险；topk1 可能牺牲注意力覆盖，当前只证明 latency。
+  2. 尝试更窄/更宽 layer range，例如 layers9-12、8-12、8-14，找 latency/质量折中。
+  3. 处理 64K + `device_map=auto` 的 TileLang AICore 问题；单卡可跑，auto 多卡不可跑。
+
+横向验证（新增）：
+
+| ctx | config | run2 | comparison / notes |
+|---:|---|---:|---|
+| 16K | layers8-13 all heads topk1，head guard 前 | 95.97s | H=32 bool-mask path A 反复 OOM fallback，负例 |
+| 16K | layers8-13 all heads topk1，head guard 后 | 1.40s | 不再触发 path A OOM |
+| 16K | dense baseline 复跑 | 1.35s | sparse 略慢，16K 不建议启用该配置 |
+| 64K | layers8-13 all heads topk1，`device_map=auto` | fail | AICore MTE out-of-range，head chunk=0 和默认 chunk=8 均失败 |
+| 64K | isolated wrapper H=1/2/4/8/16/32 topk1 | pass | H=32 isolated `68.51ms`，说明 kernel 本体和 folded-head batch 可跑 |
+| 64K | layers8-13 all heads topk1，single `npu:0` | 20.00s | `--num-runs 2 --empty-cache-between-runs`，run2 可跑 |
+
+当前策略判断：
+
+- 16K：dense 仍更快，且 path A 需要 head guard 防灾。
+- 32K：layers8-13 all heads topk1 是当前最佳点，run2 `3.74s`，小幅赢 dense `3.87s`。
+- 64K：单卡 topk1 可跑到 run2 `20.00s`，但 `device_map=auto` 会触发 TileLang AICore，暂不能作为多卡长上下文方案。
+
+## 本轮进展（2026-05-28 block-index H=1 kernel + causal fast-path）
+
+目标：消除 block_sparse path-B wrapper 里把 block indices 展开成 token-level indices 的大中间张量，并尽量让这个容量修复不拖慢 kernel。
+
+```text
+old: [B*H, n_q_blocks, topk_blocks] -> [B*H, S, topk_blocks * 64]
+new: kernel 直接接收 [B*H, n_q_blocks, 1, topk_blocks]
+```
+
+代码改动：
+
+- `minference/ops/tilelang_sparse_attention_h1.py`
+  - 新增 `build_sparse_attention_h1_block_index_fwd(...)`。
+  - 输入 `block_indices [B, n_q_blocks, 1, topk_blocks]`，kernel 内部按 `block_idx * block_I` 连续 range-load K/V。
+  - 追加 causal fast-path：更早的 K block 整块可见，直接复用 cube 得分；只有对角/部分可见 block 才生成 `BI=64` 个 token position 并做逐 token causal compare。
+- `minference/ops/block_sparse_kernel_npu.py`
+  - H=1 安全边界内默认优先走 block-index kernel，避免调用 `block_indices_to_tilelang`。
+  - 新增回退开关：`MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX=0` 可回旧 token-index H=1 路径。
+  - 原 `MINFERENCE_BLOCK_SPARSE_TILELANG_H1=0` 仍可回旧 padded-H kernel。
+- `tests/test_tilelang_sparse_attention_h1.py`
+  - 新增 block-index one-block / two-block smoke。
+- `benchmarks/bench_tilelang_h1_sparse_attention.py`
+  - 新增 token-index H=1 vs block-index H=1 kernel 对照。
+- `tests/test_block_sparse_kernel.py`
+  - 新增 block-index 默认/禁用策略测试。
+
+验证：
+
+- `python -m py_compile minference/ops/tilelang_sparse_attention_h1.py`：通过。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python -m pytest tests/test_block_sparse_kernel.py -q`：`37 passed`（fast-path 前；策略测试已覆盖）。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python tests/test_tilelang_sparse_attention_h1.py --case all`：4/4 PASS。
+  - block-index one-block / two-block 均 `max_abs_diff=9.7656e-04`。
+
+isolated kernel benchmark（S=4096, D=128）：
+
+| topk_blocks | token-index H=1 | block-index H=1 before fast-path | block-index H=1 after fast-path |
+|---:|---:|---:|---:|
+| 4 | 1.194 ms | 1.254 ms | 1.146 ms |
+| 16 | 2.389 ms | 2.945 ms | 2.145 ms |
+
+wrapper benchmark（H=1, S=32768, D=128）：
+
+| topk_blocks | token-index mean / peak alloc | block-index before fast-path | block-index after fast-path |
+|---:|---:|---:|---:|
+| 4 | 5.55 ms / 144 MB | 6.02 ms / 41 MB | 4.52 ms / 41 MB |
+| 16 | 20.62 ms / 480 MB | 22.07 ms / 41 MB | 15.74 ms / 41 MB |
+
+端到端 32K 复测（Phi-3-mini-128k-instruct，`max_new_tokens=1`，比较 run2）：
+
+| config | before block-index | block-index before fast-path | block-index after fast-path | notes |
+|---|---:|---:|---:|---|
+| probe + dense-others | 4.65s | 4.71s | 4.47s | dense baseline 仍是 3.88s |
+| all heads topk=4, no chunk | no-chunk 之前不可行 | 7.47s | 6.17s | 仍慢于 dense |
+| all heads topk=16, no chunk | OOM | 23.57s | 未复跑 E2E | wrapper topk16 已从 22.07ms 降到 15.74ms |
+
+重要结论：
+
+- block-index kernel 已解决 all-head/no-chunk 的 token-index OOM；topk16 no-chunk 能跑通。
+- causal fast-path 让 block-index 不再只是容量修复，也带来了真实 path-B 时延下降。
+- 但端到端仍未赢 dense baseline：32K probe `4.47s` vs dense `3.88s`；all-head topk4 `6.17s` 仍过慢。
+- 注意：Phi-3 E2E 不能并行跑多个进程；一次并行 probe + all-head 复测在 MLP 处 OOM。后续 E2E 必须串行。
+
+下一步建议：
+
+- 不要再只扩大 sparse 覆盖率；all-head 会把 block_sparse 计算量拉满。
+- 更有希望的方向是找 sparse 覆盖点：只把 dense-others 中最贵/最长的部分 heads 转为 low-topk block_sparse，而不是 1024/1024 heads 全覆盖。
+- kernel 侧下一步是多 head TileLang launch 或按 head group 融合，减少 64 layer-call × 多 head 的调度/折叠成本。
 
 ## 本轮进展（2026-05-27 block_sparse staging）
 

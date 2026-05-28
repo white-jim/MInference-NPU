@@ -229,9 +229,12 @@ def test_head_dim_pad_roundtrip(head_d):
 def test_short_seq_mask_path_policy_default(monkeypatch):
     """默认 4K-16K block_sparse 应优先走 bool-mask NPU 对照路径。"""
     monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_HEADS", raising=False)
     assert _should_prefer_mask_npu(4096)
     assert _should_prefer_mask_npu(16384)
     assert not _should_prefer_mask_npu(16385)
+    assert _should_prefer_mask_npu(16384, num_heads=16)
+    assert not _should_prefer_mask_npu(16384, num_heads=17)
 
 
 def test_short_seq_mask_path_policy_env_disable(monkeypatch):
@@ -246,6 +249,21 @@ def test_short_seq_mask_path_policy_env_invalid(monkeypatch):
     monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "oops")
     with pytest.warns(UserWarning, match="不是合法整数"):
         assert _should_prefer_mask_npu(4096)
+
+
+def test_short_seq_mask_path_policy_head_env(monkeypatch):
+    """短序列 path A 还要限制一次 mask 覆盖的 head 数，避免 H=32 构造超大 mask。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", raising=False)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_HEADS", "8")
+    assert _should_prefer_mask_npu(4096, num_heads=8)
+    assert not _should_prefer_mask_npu(4096, num_heads=9)
+
+
+def test_short_seq_mask_path_policy_head_env_invalid(monkeypatch):
+    """非法 head 阈值回退默认值。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_HEADS", "oops")
+    with pytest.warns(UserWarning, match="不是合法整数"):
+        assert _should_prefer_mask_npu(4096, num_heads=16)
 
 
 def test_tilelang_h1_query_block_policy_default(monkeypatch):

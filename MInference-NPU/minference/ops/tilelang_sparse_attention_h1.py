@@ -48,6 +48,7 @@ def build_sparse_attention_h1_block_fwd(
     pad_value: int = -1,
     dtype: str = "float16",
     core_num: int = 24,
+    cache_device: object | None = None,
 ):
     """Build an isolated H=1 sparse attention kernel.
 
@@ -77,7 +78,18 @@ def build_sparse_attention_h1_block_fwd(
     if pad_value != -1:
         raise NotImplementedError("H=1 experimental kernel only supports pad_value == -1")
 
-    cache_key = (dim, topk, sm_scale, block_M, block_I, q_start_index_s, pad_value, dtype, core_num)
+    cache_key = (
+        dim,
+        topk,
+        sm_scale,
+        block_M,
+        block_I,
+        q_start_index_s,
+        pad_value,
+        dtype,
+        core_num,
+        cache_device,
+    )
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -361,6 +373,7 @@ def build_sparse_attention_h1_block_index_fwd(
     q_start_index_s: int = 0,
     dtype: str = "float16",
     core_num: int = 24,
+    cache_device: object | None = None,
 ):
     """Build an H=1 sparse attention kernel that consumes block indices.
 
@@ -397,6 +410,7 @@ def build_sparse_attention_h1_block_index_fwd(
         q_start_index_s,
         dtype,
         core_num,
+        cache_device,
     )
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -532,11 +546,6 @@ def build_sparse_attention_h1_block_index_fwd(
 
                             for i_i in range(NI):
                                 block_start = BlockIndices[b_i, q_block_i, 0, i_i] * BI
-                                for col in T.serial(BI):
-                                    indices_ub[col] = block_start + col
-                                T.barrier_all()
-                                T.copy(indices_ub, indices_float)
-                                T.barrier_all()
 
                                 T.copy(
                                     K[
@@ -580,17 +589,26 @@ def build_sparse_attention_h1_block_index_fwd(
                                 )
                                 T.barrier_all()
 
-                                for row in T.serial(v_block):
-                                    q_abs = s_base + vid * v_block + row + q_start_index_s
-                                    T.tile.compare(mask_ub, indices_float, T.float32(q_abs), "LE")
-                                    T.tile.select(
-                                        acc_s_ub[row, :],
-                                        mask_ub,
-                                        acc_s_from_cube[row, :],
-                                        -T.infinity(accum_dtype),
-                                        "VSEL_TENSOR_SCALAR_MODE",
-                                    )
+                                if block_start + BI - 1 <= s_base + vid * v_block + q_start_index_s:
+                                    T.copy(acc_s_from_cube, acc_s_ub)
+                                else:
+                                    for col in T.serial(BI):
+                                        indices_ub[col] = block_start + col
                                     T.barrier_all()
+                                    T.copy(indices_ub, indices_float)
+                                    T.barrier_all()
+
+                                    for row in T.serial(v_block):
+                                        q_abs = s_base + vid * v_block + row + q_start_index_s
+                                        T.tile.compare(mask_ub, indices_float, T.float32(q_abs), "LE")
+                                        T.tile.select(
+                                            acc_s_ub[row, :],
+                                            mask_ub,
+                                            acc_s_from_cube[row, :],
+                                            -T.infinity(accum_dtype),
+                                            "VSEL_TENSOR_SCALAR_MODE",
+                                        )
+                                        T.barrier_all()
 
                                 T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
                                 T.barrier_all()

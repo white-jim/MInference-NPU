@@ -24,8 +24,18 @@ BLOCK_DENSE_OTHERS_OUTPUT = (
 BLOCK_ALL_HEADS_OUTPUT = (
     CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_all_heads_latency.json"
 )
+BLOCK_LAYERS8_13_ALL_HEADS_TOPK1_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json"
+)
+BLOCK_LAYERS8_13_ALL_HEADS_TOPK2_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk2_latency.json"
+)
+BLOCK_LAYERS8_13_ALL_HEADS_TOPK4_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk4_latency.json"
+)
 NUM_LAYERS = 32
 NUM_HEADS = 32
+TARGET_LAYERS = tuple(range(8, 14))
 
 STREAM_TARGET_HEADS = [
     (8, 1, 0.96484375),
@@ -104,6 +114,25 @@ def _build_all_block_sparse_config(*, topk_blocks: int) -> tuple[list[dict[str, 
     return out, NUM_LAYERS * NUM_HEADS
 
 
+def _build_layer_range_block_sparse_config(
+    *,
+    layers: tuple[int, ...],
+    topk_blocks: int,
+) -> tuple[list[dict[str, list]], int]:
+    out = [
+        {
+            str(head): (
+                ["block_sparse", topk_blocks, 0, 1.0]
+                if layer in layers
+                else ["dense", 0, 0, 1.0]
+            )
+            for head in range(NUM_HEADS)
+        }
+        for layer in range(NUM_LAYERS)
+    ]
+    return out, len(layers) * NUM_HEADS
+
+
 def _write_json(path: Path, data: list[dict[str, list]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -116,6 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-dense-others-output", type=Path, default=STREAM_DENSE_OTHERS_OUTPUT)
     parser.add_argument("--block-dense-others-output", type=Path, default=BLOCK_DENSE_OTHERS_OUTPUT)
     parser.add_argument("--block-all-heads-output", type=Path, default=BLOCK_ALL_HEADS_OUTPUT)
+    parser.add_argument("--block-layers8-13-topk1-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK1_OUTPUT)
+    parser.add_argument("--block-layers8-13-topk2-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK2_OUTPUT)
+    parser.add_argument("--block-layers8-13-topk4-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK4_OUTPUT)
     parser.add_argument("--n-init", type=int, default=128)
     parser.add_argument("--n-local", type=int, default=896)
     parser.add_argument("--topk-blocks", type=int, default=16)
@@ -144,9 +176,24 @@ def main() -> int:
     block_all_heads_data, block_all_heads_count = _build_all_block_sparse_config(
         topk_blocks=args.topk_blocks,
     )
+    layer_range_outputs = [
+        (args.block_layers8_13_topk1_output, 1),
+        (args.block_layers8_13_topk2_output, 2),
+        (args.block_layers8_13_topk4_output, 4),
+    ]
     _write_json(args.stream_dense_others_output, stream_dense_others_data)
     _write_json(args.block_dense_others_output, block_dense_others_data)
     _write_json(args.block_all_heads_output, block_all_heads_data)
+    for output_path, topk in layer_range_outputs:
+        layer_range_data, layer_range_count = _build_layer_range_block_sparse_config(
+            layers=TARGET_LAYERS,
+            topk_blocks=topk,
+        )
+        _write_json(output_path, layer_range_data)
+        print(
+            f"[block+layers8-13]  rewrote {layer_range_count} heads "
+            f"(topk={topk}) -> {output_path}"
+        )
 
     print(
         f"[stream+dense-others] rewrote {stream_dense_others_count} heads "

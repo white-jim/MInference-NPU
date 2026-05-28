@@ -55,6 +55,7 @@ def build_sparse_attention_qkv_fwd(
     dtype: str = "float16",
     core_num: int = 24,
     use_contiguous_range_load: bool = False,
+    cache_device: object | None = None,
 ):
     """Build a TileLang sparse attention kernel for separate Q/K/V tensors.
 
@@ -90,6 +91,7 @@ def build_sparse_attention_qkv_fwd(
         dtype,
         core_num,
         use_contiguous_range_load,
+        cache_device,
     )
     cached = _KERNEL_CACHE.get(cache_key)
     if cached is not None:
