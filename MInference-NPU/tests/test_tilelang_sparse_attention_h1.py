@@ -231,8 +231,8 @@ def run_mh_block_index_case(name: str, h_test: int, max_blocks: int, device: tor
     print(f"[case] {name}  H={h_test}  max_blocks={max_blocks}")
     print("=" * 60)
 
-    q, k, v = _make_qkv_mh(device, h_test)
-    block_indices_cpu = _make_block_indices_mh(h_test, max_blocks)
+    q, k, v = _make_qkv_mh(device, h_test)  # q: [B, S_Q, h_test, D]
+    block_indices_cpu = _make_block_indices_mh(h_test, max_blocks)  # [B, h_test, n_q_blocks, max_blocks]
     token_indices = block_indices_to_tilelang(
         block_indices_cpu,
         S_q=S_Q,
@@ -240,16 +240,30 @@ def run_mh_block_index_case(name: str, h_test: int, max_blocks: int, device: tor
         block_size_N=BLOCK,
         kv_heads=h_test,
     ).to(device)
-    # kernel 期待 [B, n_q_blocks, H, max_blocks]
-    block_indices = block_indices_cpu.permute(0, 2, 1, 3).contiguous().to(device)
+
+    flat_B = B * h_test
+    n_q_blocks = S_Q // BLOCK
+
+    # Fold [B, S, H, D] → [B*H, S, 1, D] so T.copy sees contiguous stride_S = D
+    q_flat = q.permute(0, 2, 1, 3).contiguous().reshape(flat_B, 1, S_Q, D).transpose(1, 2).contiguous()
+    k_flat = k.permute(0, 2, 1, 3).contiguous().reshape(flat_B, 1, S_K, D).transpose(1, 2).contiguous()
+    v_flat = v.permute(0, 2, 1, 3).contiguous().reshape(flat_B, 1, S_K, D).transpose(1, 2).contiguous()
+
+    # [B, h_test, n_q_blocks, max_blocks] → [B*H, n_q_blocks, 1, max_blocks]
+    block_indices_flat = (
+        block_indices_cpu
+        .reshape(flat_B, n_q_blocks, max_blocks)
+        .unsqueeze(2)
+        .to(device=device, dtype=torch.int32)
+    )
+
     print(
-        f"[{name}] q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
-        f"block_indices={tuple(block_indices.shape)} topk_blocks={max_blocks} block_M={BLOCK_M}"
+        f"[{name}] q_flat={tuple(q_flat.shape)} k_flat={tuple(k_flat.shape)} "
+        f"block_indices_flat={tuple(block_indices_flat.shape)} topk_blocks={max_blocks} block_M={BLOCK_M}"
     )
 
     kernel = build_sparse_attention_mh_block_index_fwd(
         dim=D,
-        heads=h_test,
         topk_blocks=max_blocks,
         block_M=BLOCK_M,
         block_I=BLOCK,
@@ -257,11 +271,14 @@ def run_mh_block_index_case(name: str, h_test: int, max_blocks: int, device: tor
     )
 
     try:
-        out_tl = kernel(q, k, v, block_indices)
+        out_flat = kernel(q_flat, k_flat, v_flat, block_indices_flat)  # [B*H, S, 1, D]
     except Exception:
         print(f"[{name}] kernel call failed:")
         traceback.print_exc()
         return False
+
+    # Unfold: [B*H, S, 1, D] → [B, h_test, S, D] → [B, S, h_test, D]
+    out_tl = out_flat.squeeze(2).reshape(B, h_test, S_Q, D).permute(0, 2, 1, 3).contiguous()
 
     out_ref = sparse_attention_qkv_reference(
         q.cpu(),

@@ -407,33 +407,36 @@ def _block_sparse_tilelang_npu(
     S_k = k.shape[2]
     cache_device = _set_current_npu_device_for(q)
 
-    # MH path: 直接按 BHSD → BSHD 转一次，不再 fold-into-batch
+    # MH path: fold B*H into batch (contiguous; avoids non-contiguous T.copy for H>1)
     if _should_use_tilelang_mh_block_index(S_q, S_k, block_size):
-        block_indices_bhnt = _select_block_sparse_topk_indices(
-            q.contiguous(), k.contiguous(), topk_blocks, block_size
-        )  # [B, H, n_q_blocks, topk]
+        flat_B = B * H
+        q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)   # [B*H, 1, S, D]
+        k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
+        v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
+        block_indices_flat = _select_block_sparse_topk_indices(
+            q_flat, k_flat, topk_blocks, block_size
+        )  # [B*H, 1, n_q_blocks, topk]
         tilelang_sparse_attention_h1 = _load_sibling_module(
             "tilelang_sparse_attention_h1_block_sparse_standalone",
             "tilelang_sparse_attention_h1.py",
         )
-        block_indices_bnht = block_indices_bhnt.permute(0, 2, 1, 3).contiguous().to(
+        block_indices_bsh = block_indices_flat.permute(0, 2, 1, 3).contiguous().to(
             device=q.device,
             dtype=torch.int32,
-        )
-        q_bshd = q.permute(0, 2, 1, 3).contiguous()
-        k_bshd = k.permute(0, 2, 1, 3).contiguous()
-        v_bshd = v.permute(0, 2, 1, 3).contiguous()
+        )  # [B*H, n_q_blocks, 1, topk]
+        q_bshd = q_flat.transpose(1, 2).contiguous()   # [B*H, S, 1, D]
+        k_bshd = k_flat.transpose(1, 2).contiguous()
+        v_bshd = v_flat.transpose(1, 2).contiguous()
         kernel = tilelang_sparse_attention_h1.build_sparse_attention_mh_block_index_fwd(
             dim=D,
-            heads=H,
-            topk_blocks=block_indices_bnht.shape[-1],
+            topk_blocks=block_indices_bsh.shape[-1],
             block_M=_TILELANG_H1_BLOCK_M,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
             cache_device=cache_device,
         )
-        out_bshd = kernel(q_bshd, k_bshd, v_bshd, block_indices_bnht)
-        return out_bshd.permute(0, 2, 1, 3).contiguous()  # → [B, H, S_q, D]
+        out_bshd = kernel(q_bshd, k_bshd, v_bshd, block_indices_bsh)  # [B*H, S, 1, D]
+        return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
 
     # 回退路径：H=1 fold-into-batch（原行为）
     flat_B = B * H

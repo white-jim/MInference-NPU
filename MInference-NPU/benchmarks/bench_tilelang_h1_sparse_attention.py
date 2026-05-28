@@ -243,20 +243,25 @@ def run_mh_vs_h1_case(
         block_size=block_size,
         topk_blocks=topk_blocks,
         heads=heads,
-    )
-    # MH kernel expects [B, n_q_blocks, H, topk_blocks]
-    block_indices_mh = block_indices_bhnt.permute(0, 2, 1, 3).contiguous().to(device)
+    )  # [1, heads, n_q_blocks, topk_blocks]
+    n_q_blocks = seq_len // block_size
+
+    # MH kernel: pre-fold [1, S, H, D] → [H, S, 1, D] (same fold-into-batch as H=1 path)
+    q_flat = q_bshd.permute(0, 2, 1, 3).contiguous().reshape(heads, 1, seq_len, dim).transpose(1, 2).contiguous()
+    k_flat = k_bshd.permute(0, 2, 1, 3).contiguous().reshape(heads, 1, seq_len, dim).transpose(1, 2).contiguous()
+    v_flat = v_bshd.permute(0, 2, 1, 3).contiguous().reshape(heads, 1, seq_len, dim).transpose(1, 2).contiguous()
+    # [1, H, n_q, topk] → [H, n_q, 1, topk]
+    block_indices_flat = block_indices_bhnt.reshape(heads, n_q_blocks, topk_blocks).unsqueeze(2).contiguous().to(device)
 
     mh_kernel = build_sparse_attention_mh_block_index_fwd(
         dim=dim,
-        heads=heads,
         topk_blocks=topk_blocks,
         block_M=block_m,
         block_I=block_size,
         q_start_index_s=0,
     )
 
-    # H=1 fold-into-batch 模拟：把 (1, S, H, D) reshape 为 (1, H, S, 1, D) → (H, S, 1, D)
+    # H=1 fold-into-batch 模拟：把 (1, S, H, D) reshape 为 (H, S, 1, D)
     # 然后按 head_chunk 切多次 launch（复现 wrapper 行为）
     h1_block_index_kernel = build_sparse_attention_h1_block_index_fwd(
         dim=dim,
@@ -266,17 +271,10 @@ def run_mh_vs_h1_case(
         q_start_index_s=0,
     )
 
-    # 折叠版输入: BHSD 直接 transpose 到 [H, S, 1, D]
-    q_h1 = q_bshd.permute(0, 2, 1, 3).contiguous()  # [1, H, S, D]
-    k_h1 = k_bshd.permute(0, 2, 1, 3).contiguous()
-    v_h1 = v_bshd.permute(0, 2, 1, 3).contiguous()
-    # block_indices_h1: [1, H, n_q_blocks, topk] → flat to [H, n_q_blocks, 1, topk]
-    h1_indices_full = block_indices_bhnt.reshape(heads, -1, 1, topk_blocks).contiguous().to(device)
+    # 折叠版输入: BSHD → [H, S, 1, D]（与 MH kernel 输入完全相同）
+    h1_indices_full = block_indices_flat  # [H, n_q_blocks, 1, topk]
 
     def _h1_one_launch():
-        q_flat = q_h1.reshape(heads, seq_len, 1, dim)
-        k_flat = k_h1.reshape(heads, seq_len, 1, dim)
-        v_flat = v_h1.reshape(heads, seq_len, 1, dim)
         return h1_block_index_kernel(q_flat, k_flat, v_flat, h1_indices_full)
 
     def _h1_chunked():
@@ -285,9 +283,9 @@ def run_mh_vs_h1_case(
         outs = []
         for start in range(0, heads, head_chunk):
             end = min(start + head_chunk, heads)
-            q_chunk = q_h1[:, start:end, :, :].reshape(end - start, seq_len, 1, dim).contiguous()
-            k_chunk = k_h1[:, start:end, :, :].reshape(end - start, seq_len, 1, dim).contiguous()
-            v_chunk = v_h1[:, start:end, :, :].reshape(end - start, seq_len, 1, dim).contiguous()
+            q_chunk = q_flat[start:end].contiguous()
+            k_chunk = k_flat[start:end].contiguous()
+            v_chunk = v_flat[start:end].contiguous()
             idx_chunk = h1_indices_full[start:end].contiguous()
             outs.append(h1_block_index_kernel(q_chunk, k_chunk, v_chunk, idx_chunk))
         return torch.cat(outs, dim=0)
@@ -298,19 +296,15 @@ def run_mh_vs_h1_case(
     )
 
     mh_t, mh_out = _time_kernel(
-        "mh_one_launch", lambda: mh_kernel(q_bshd, k_bshd, v_bshd, block_indices_mh),
+        "mh_one_launch", lambda: mh_kernel(q_flat, k_flat, v_flat, block_indices_flat),
         warmup=warmup, iters=iters,
     )
     h1_t, h1_out = _time_kernel(
         "h1_chunked", _h1_chunked, warmup=warmup, iters=iters,
     )
 
-    # 数值对比：把 h1_out [H, S, 1, D] 还原为 BSHD
-    h1_out_bshd = h1_out.reshape(heads, seq_len, dim).unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-    # mh_out 已经是 [B, S, H, D] → permute 到 [B, H, S, D] 再 permute 回 BSHD 比较
-    h1_out_bshd = h1_out_bshd  # [1, H, S, D]
-    mh_out_bhsd = mh_out.permute(0, 2, 1, 3).contiguous()  # [1, H, S, D]
-    diff = (mh_out_bhsd.float() - h1_out_bshd.float()).abs()
+    # 数值对比：mh_out 和 h1_out 都是 [H, S, 1, D]
+    diff = (mh_out.float() - h1_out.float()).abs()
     max_diff = float(diff.max().item())
     mean_diff = float(diff.mean().item())
     speedup = h1_t / mh_t if mh_t > 0 else float("inf")
