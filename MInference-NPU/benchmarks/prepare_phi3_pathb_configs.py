@@ -140,6 +140,49 @@ def _write_json(path: Path, data: list[dict[str, list]]) -> None:
         f.write("\n")
 
 
+def _parse_layer_range(spec: str) -> tuple[int, int]:
+    """Parse ``"8-13"`` into ``(8, 13)`` inclusive. Single int ``"8"`` -> ``(8, 8)``."""
+    spec = spec.strip()
+    if "-" in spec:
+        lo_s, hi_s = spec.split("-", 1)
+        lo, hi = int(lo_s), int(hi_s)
+    else:
+        lo = hi = int(spec)
+    if not (0 <= lo <= hi < NUM_LAYERS):
+        raise ValueError(
+            f"layer range {spec!r} out of [0, {NUM_LAYERS - 1}] or lo > hi"
+        )
+    return lo, hi
+
+
+def _parse_layer_ranges_csv(raw: str) -> list[tuple[int, int]]:
+    if not raw:
+        return []
+    return [_parse_layer_range(item) for item in raw.split(",") if item.strip()]
+
+
+def _parse_topks_csv(raw: str) -> list[int]:
+    if not raw:
+        return []
+    topks: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        v = int(item)
+        if v < 1:
+            raise ValueError(f"topk must be >= 1, got {v}")
+        topks.append(v)
+    return topks
+
+
+def _layer_range_config_name(lo: int, hi: int, topk: int) -> str:
+    return (
+        f"Phi_3_mini_128k_instruct_pathb_block_sparse_"
+        f"layers{lo}_{hi}_all_heads_topk{topk}_latency.json"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stream-dense-others-output", type=Path, default=STREAM_DENSE_OTHERS_OUTPUT)
@@ -148,6 +191,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-layers8-13-topk1-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK1_OUTPUT)
     parser.add_argument("--block-layers8-13-topk2-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK2_OUTPUT)
     parser.add_argument("--block-layers8-13-topk4-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK4_OUTPUT)
+    parser.add_argument(
+        "--extra-layer-ranges",
+        type=str,
+        default="",
+        help='额外 block_sparse layer range 集合，逗号分隔。例如 "7-14,8-12,9-12,8-14"。'
+             "每个 range 与 --extra-topks 做 cartesian 生成配置。",
+    )
+    parser.add_argument(
+        "--extra-topks",
+        type=str,
+        default="",
+        help='额外 block_sparse topk_blocks 集合，逗号分隔。例如 "1,2,4"。'
+             "需配合 --extra-layer-ranges 使用。",
+    )
+    parser.add_argument(
+        "--extra-output-dir",
+        type=Path,
+        default=CONFIG_DIR,
+        help="额外 block_sparse latency configs 的输出目录。",
+    )
     parser.add_argument("--n-init", type=int, default=128)
     parser.add_argument("--n-local", type=int, default=896)
     parser.add_argument("--topk-blocks", type=int, default=16)
@@ -194,6 +257,26 @@ def main() -> int:
             f"[block+layers8-13]  rewrote {layer_range_count} heads "
             f"(topk={topk}) -> {output_path}"
         )
+
+    extra_ranges = _parse_layer_ranges_csv(args.extra_layer_ranges)
+    extra_topks = _parse_topks_csv(args.extra_topks)
+    if (extra_ranges and not extra_topks) or (extra_topks and not extra_ranges):
+        raise SystemExit(
+            "--extra-layer-ranges 和 --extra-topks 必须同时给定才能生成额外配置"
+        )
+    for lo, hi in extra_ranges:
+        layer_tuple = tuple(range(lo, hi + 1))
+        for topk in extra_topks:
+            data, count = _build_layer_range_block_sparse_config(
+                layers=layer_tuple,
+                topk_blocks=topk,
+            )
+            out_path = args.extra_output_dir / _layer_range_config_name(lo, hi, topk)
+            _write_json(out_path, data)
+            print(
+                f"[block+layers{lo}-{hi}] rewrote {count} heads "
+                f"(topk={topk}) -> {out_path}"
+            )
 
     print(
         f"[stream+dense-others] rewrote {stream_dense_others_count} heads "

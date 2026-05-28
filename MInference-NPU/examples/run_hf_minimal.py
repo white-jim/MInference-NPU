@@ -21,8 +21,48 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
+import math
 import os
+import sys
 import time
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RUN_DIR = REPO_ROOT / "benchmarks" / "results" / "runs"
+
+
+class _Tee:
+    """Minimal stdout tee that forwards writes to multiple text streams."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+            st.flush()
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
+
+    def isatty(self):  # generate() / tqdm 偶尔会查询；保持 False，无 fancy 控制字符
+        return False
+
+
+def _resolve_run_path(spec: Path | None) -> Path | None:
+    """Bare-filename → benchmarks/results/runs/<filename>；其他保持原样。
+
+    设计目的：让 ``--save-output dense_32k.json`` 自动落到 runs 目录，
+    同时保留对 ``./xx`` / 绝对路径 / 多段相对路径的尊重。
+    """
+    if spec is None:
+        return None
+    if not spec.is_absolute() and len(spec.parts) == 1:
+        return DEFAULT_RUN_DIR / spec.name
+    return spec
 
 
 def main() -> int:
@@ -82,7 +122,68 @@ def main() -> int:
         action="store_true",
         help="长上下文调试用：每次 generate 后释放输出并 empty_cache，避免 HF 4D mask 重复分配导致 OOM。",
     )
+    parser.add_argument(
+        "--save-output",
+        type=Path,
+        default=None,
+        help="持久化 generate 输出（token ids + per-step top-K logits）到 JSON，"
+             "供后续 --compare-to 做 sparse vs dense 质量对照。"
+             "强制 generate(output_scores=True, return_dict_in_generate=True)。",
+    )
+    parser.add_argument(
+        "--compare-to",
+        type=Path,
+        default=None,
+        help="读取另一份 --save-output 生成的 JSON 与当前 run 对比，"
+             "输出 token 匹配率、top-1/top-5 命中、KL divergence（基于 union top-K）。",
+    )
+    parser.add_argument(
+        "--quality-top-k",
+        type=int,
+        default=32,
+        help="--save-output 时每步保留的 top-K 个 token / logits，"
+             "用于 compare 阶段近似 KL。默认 32，足够覆盖常见 top-5/10 重合 + KL 近似。",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="把脚本 stdout tee 到该文件。裸文件名会被放到 "
+             f"{DEFAULT_RUN_DIR.relative_to(REPO_ROOT)} 下，便于 commit/push 后在开发机 git pull 查看。",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="便捷参数：等价于 --log-file <NAME>.log（除非 --log-file 显式给定）。",
+    )
     args = parser.parse_args()
+
+    # --- 解析输出路径：裸文件名 → benchmarks/results/runs/<file> ---
+    args.save_output = _resolve_run_path(args.save_output)
+    args.compare_to = _resolve_run_path(args.compare_to)
+    args.log_file = _resolve_run_path(args.log_file)
+    if args.log_file is None and args.run_name:
+        args.log_file = DEFAULT_RUN_DIR / f"{args.run_name}.log"
+
+    # --- 安装 stdout tee（如有） ---
+    log_handle = None
+    orig_stdout = sys.stdout
+    if args.log_file is not None:
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(args.log_file, "w", encoding="utf-8")
+        sys.stdout = _Tee(orig_stdout, log_handle)
+        print(f"[log] tee stdout -> {args.log_file}")
+
+    try:
+        return _run_with_args(args)
+    finally:
+        if log_handle is not None:
+            sys.stdout = orig_stdout
+            log_handle.close()
+
+
+def _run_with_args(args: argparse.Namespace) -> int:
 
     hf_cache = "/data/guoshiyao/resources/.hf_cache"
     os.environ.setdefault("HF_HOME", hf_cache)
@@ -235,8 +336,12 @@ def main() -> int:
     print(f"[4/4] generate(max_new_tokens={args.max_new_tokens})")
     if args.num_runs < 1:
         raise ValueError("--num-runs must be >= 1")
+    if args.save_output is not None and args.quality_top_k < 1:
+        raise ValueError("--quality-top-k must be >= 1 when --save-output is given")
     run_times = []
     out = None
+    last_scores: list | None = None
+    want_scores = args.save_output is not None or args.compare_to is not None
     try:
         with torch.no_grad():
             model_device = next(model.parameters()).device
@@ -244,18 +349,28 @@ def main() -> int:
             attention_mask_device = attention_mask.to(model_device)
             for run_idx in range(args.num_runs):
                 t0 = time.time()
-                out = model.generate(
-                    input_ids_device,
+                gen_kwargs = dict(
                     attention_mask=attention_mask_device,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                 )
+                if want_scores:
+                    gen_kwargs["output_scores"] = True
+                    gen_kwargs["return_dict_in_generate"] = True
+                gen_out = model.generate(input_ids_device, **gen_kwargs)
+                if want_scores:
+                    out = gen_out.sequences
+                    last_scores = list(gen_out.scores)
+                else:
+                    out = gen_out
                 dt_run = time.time() - t0
                 run_times.append(dt_run)
                 print(f"    run {run_idx + 1}/{args.num_runs}: {dt_run:.2f}s")
                 if args.empty_cache_between_runs and run_idx + 1 < args.num_runs:
-                    del out
+                    del out, gen_out
                     out = None
+                    if want_scores:
+                        last_scores = None
                     _sync_npu()
                     gc.collect()
                     if hasattr(torch, "npu"):
@@ -280,7 +395,212 @@ def main() -> int:
             print(f"      {name}: {item['seconds']:.3f}s over {item['count']} calls")
     print(f"    输出文本：{tokenizer.decode(new_tokens, skip_special_tokens=True)!r}")
 
+    if args.save_output is not None:
+        assert last_scores is not None, "internal error: --save-output but no scores captured"
+        _save_quality_output(
+            path=args.save_output,
+            generated_token_ids=new_tokens.tolist(),
+            scores=last_scores,
+            top_k=args.quality_top_k,
+            metadata={
+                "model": args.model,
+                "model_path": args.model_path,
+                "config_path": str(args.config_path) if args.config_path else None,
+                "ctx_len": int(input_ids.shape[1]),
+                "max_new_tokens": int(args.max_new_tokens),
+                "attn_type": args.attn_type,
+                "device_map": args.device_map,
+                "quality_top_k": int(args.quality_top_k),
+                "run_times_seconds": [float(t) for t in run_times],
+            },
+        )
+        print(f"    [quality] 保存输出 -> {args.save_output}")
+
+    if args.compare_to is not None:
+        assert last_scores is not None, "--compare-to requires --save-output to capture scores"
+        _compare_quality_outputs(
+            reference_path=args.compare_to,
+            current_token_ids=new_tokens.tolist(),
+            current_scores=last_scores,
+            top_k=args.quality_top_k,
+        )
+
     return 0
+
+
+def _save_quality_output(
+    path: Path,
+    generated_token_ids: list[int],
+    scores,
+    top_k: int,
+    metadata: dict,
+) -> None:
+    """Dump greedy decode token ids + per-step top-K logits to JSON."""
+    import torch as _torch
+
+    per_step = []
+    for step_logits in scores:
+        # step_logits: [batch=1, vocab]; greedy, only batch entry 0.
+        v = step_logits[0].detach().float().cpu()
+        k = min(top_k, v.shape[-1])
+        topv, topi = _torch.topk(v, k=k)
+        per_step.append(
+            {
+                "token_ids": topi.tolist(),
+                "logits": topv.tolist(),
+            }
+        )
+    payload = {
+        "metadata": metadata,
+        "generated_token_ids": [int(t) for t in generated_token_ids],
+        "per_step_top_k": per_step,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f)
+        f.write("\n")
+
+
+def _compare_quality_outputs(
+    reference_path: Path,
+    current_token_ids: list[int],
+    current_scores,
+    top_k: int,
+) -> None:
+    import torch as _torch
+
+    with reference_path.open() as f:
+        ref = json.load(f)
+    ref_meta = ref.get("metadata", {})
+    ref_tokens = ref["generated_token_ids"]
+    ref_per_step = ref["per_step_top_k"]
+
+    cur_tokens = [int(t) for t in current_token_ids]
+    cur_per_step = []
+    for step_logits in current_scores:
+        v = step_logits[0].detach().float().cpu()
+        k = min(top_k, v.shape[-1])
+        topv, topi = _torch.topk(v, k=k)
+        cur_per_step.append(
+            {
+                "token_ids": topi.tolist(),
+                "logits": topv.tolist(),
+            }
+        )
+
+    n_compare = min(len(ref_tokens), len(cur_tokens), len(ref_per_step), len(cur_per_step))
+    print()
+    print("    [quality] reference:", reference_path)
+    print(
+        f"    [quality] reference attn_type={ref_meta.get('attn_type')!r}, "
+        f"config_path={ref_meta.get('config_path')!r}, "
+        f"ctx_len={ref_meta.get('ctx_len')}, "
+        f"max_new_tokens={ref_meta.get('max_new_tokens')}, "
+        f"top_k={ref_meta.get('quality_top_k')}"
+    )
+    print(
+        f"    [quality] compare first {n_compare} steps "
+        f"(ref_len={len(ref_tokens)}, cur_len={len(cur_tokens)})"
+    )
+
+    if n_compare == 0:
+        print("    [quality] nothing to compare.")
+        return
+
+    # ---- 1. token sequence match ----
+    seq_match_total = 0
+    first_div = None
+    longest_prefix = 0
+    streak = True
+    for i in range(n_compare):
+        if cur_tokens[i] == ref_tokens[i]:
+            seq_match_total += 1
+            if streak:
+                longest_prefix += 1
+        else:
+            if streak:
+                first_div = i
+                streak = False
+    print(
+        f"    [quality] token greedy match: "
+        f"{seq_match_total}/{n_compare} "
+        f"({100.0 * seq_match_total / n_compare:.1f}%); "
+        f"longest matching prefix = {longest_prefix}; "
+        f"first divergence step = {first_div}"
+    )
+
+    # ---- 2. top-1 / top-5 set agreement (ref-vs-cur per step) ----
+    top1_match = 0
+    top5_overlap_sum = 0.0
+    for i in range(n_compare):
+        ref_ids = ref_per_step[i]["token_ids"]
+        cur_ids = cur_per_step[i]["token_ids"]
+        if not ref_ids or not cur_ids:
+            continue
+        if ref_ids[0] == cur_ids[0]:
+            top1_match += 1
+        k5 = min(5, len(ref_ids), len(cur_ids))
+        ref_set = set(ref_ids[:k5])
+        cur_set = set(cur_ids[:k5])
+        if ref_set and cur_set:
+            top5_overlap_sum += len(ref_set & cur_set) / float(k5)
+    print(
+        f"    [quality] per-step top-1 match: "
+        f"{top1_match}/{n_compare} "
+        f"({100.0 * top1_match / n_compare:.1f}%); "
+        f"per-step top-5 jaccard mean = "
+        f"{top5_overlap_sum / n_compare:.3f}"
+    )
+
+    # ---- 3. KL divergence on union of top-K (approx) ----
+    # Reference -> current direction: KL(P_ref || Q_cur) using union(top-K) per step.
+    # Missing tokens use logit = -inf -> prob 0; safe because we take union.
+    kl_sum = 0.0
+    kl_n = 0
+    for i in range(n_compare):
+        ref_ids = ref_per_step[i]["token_ids"]
+        ref_logits = ref_per_step[i]["logits"]
+        cur_ids = cur_per_step[i]["token_ids"]
+        cur_logits = cur_per_step[i]["logits"]
+        ref_map = dict(zip(ref_ids, ref_logits))
+        cur_map = dict(zip(cur_ids, cur_logits))
+        union = list(ref_map.keys() | cur_map.keys())
+        if not union:
+            continue
+        neg_inf = float("-inf")
+        ref_vec = [ref_map.get(t, neg_inf) for t in union]
+        cur_vec = [cur_map.get(t, neg_inf) for t in union]
+
+        def _softmax(xs):
+            mx = max(x for x in xs if x != neg_inf)
+            exps = [math.exp(x - mx) if x != neg_inf else 0.0 for x in xs]
+            s = sum(exps)
+            return [e / s for e in exps] if s > 0 else [0.0] * len(exps)
+
+        p = _softmax(ref_vec)
+        q = _softmax(cur_vec)
+        # KL(P||Q) = sum P log(P/Q). For p==0 contribute 0.
+        kl = 0.0
+        for pp, qq in zip(p, q):
+            if pp > 0.0 and qq > 0.0:
+                kl += pp * math.log(pp / qq)
+            elif pp > 0.0 and qq == 0.0:
+                # ref mass on a token current never put in top-K: large penalty.
+                kl += float("inf")
+                break
+        if math.isfinite(kl):
+            kl_sum += kl
+            kl_n += 1
+    if kl_n > 0:
+        print(
+            f"    [quality] approx KL(ref||cur) on top-{top_k} union: "
+            f"mean over {kl_n}/{n_compare} steps = {kl_sum / kl_n:.4f} nats"
+        )
+    else:
+        print(
+            "    [quality] KL: 所有比较步都出现 ref top-K token 不在 cur top-K，"
+            "KL = +inf；说明 sparse vs dense 分布偏移很大。"
+        )
 
 
 if __name__ == "__main__":

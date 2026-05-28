@@ -1,6 +1,6 @@
 # Context Checkpoint
 
-Last update: 2026-05-28（晚 — 修复 TileLang 多卡 device cache，64K auto 多卡 block_sparse 稳态赢 dense）
+Last update: 2026-05-28（夜 — 加 layer-range / topk config 生成器；run_hf_minimal 加 sparse vs dense quality probe + 日志目录）
 
 ## Current Direction
 
@@ -27,6 +27,143 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python <cmd>
 Local model：`/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 
 `PYTHONPATH` 里的 `~/tilelang-ascend` 现在只为 `block_sparse` 需要；stream_llm 路径已不依赖 TileLang。
+
+## 本轮进展（2026-05-28 夜 — 横扫 tooling + quality probe）
+
+目标：把 checkpoint 里仍未完成的两条遗留收尾。`device_map=auto` 多卡问题
+本周已修；剩两件是 layer range / topk 横扫和 layers8-13 topk1 的输出质量验证。
+本轮不动 kernel，纯 tooling。
+
+### 新增/扩展
+
+- `benchmarks/prepare_phi3_pathb_configs.py`
+  - 保留原有固定 layers8-13 配置以避免回归。
+  - 新增 `--extra-layer-ranges`（如 `"7-14,8-12,9-12,8-14"`）与
+    `--extra-topks`（如 `"1,2,4"`）做 cartesian。
+  - 输出统一命名 `Phi_3_mini_128k_instruct_pathb_block_sparse_layers{lo}_{hi}_all_heads_topk{k}_latency.json`。
+- `examples/run_hf_minimal.py`
+  - 新增 `--save-output PATH`：把 generate 的 `output_scores=True` 拿到的
+    per-step top-K logits + 完整 token ids dump 成 JSON。
+  - 新增 `--compare-to PATH`：读 reference JSON 与当前 run 对比，给出：
+    1. token greedy 完全匹配率 + longest matching prefix + first divergence 步号。
+    2. per-step top-1 命中率、top-5 jaccard 重合率。
+    3. 基于 union(top-K) 的近似 KL(ref || cur)，单位 nats。
+       某步出现 ref top-K token 不在 cur top-K 时该步标记 +inf 并跳过；
+       全部 +inf 则提示 "分布偏移很大"。
+  - 新增 `--quality-top-k`（默认 32）控制保留的 top-K 大小。
+  - 新增 `--log-file PATH` / `--run-name NAME`：
+    - 把 stdout tee 到该日志文件，方便 server 上跑完后 commit/push 给开发机看。
+    - 裸文件名（无目录分隔）自动落到 `benchmarks/results/runs/`。
+    - `--run-name foo` 等价于 `--log-file foo.log`。
+- `benchmarks/results/runs/.gitkeep`：保留目录跟踪。该目录里的 `.log` / `.json`
+  允许定期手动清理，但默认 commit 进 git，方便在开发机 `git pull` 后直接看。
+
+### 推荐横扫矩阵
+
+先做 4 组 quality reference（一次性 dense baseline，后续所有 sparse 都拿它对照）：
+
+- ctx ∈ {4096, 16384, 32768, 65536}
+- attn_type = dense
+
+再扫 layer ranges × topks：
+
+- layer ranges: `7-14,8-13,8-12,9-12,8-14,9-14,10-13`
+- topks: `1, 2, 4`
+- ctx: 优先 32K（已知小幅赢 dense）和 64K（已知大幅赢 dense）
+
+每组都在同一 prompt（`run_hf_minimal.py` 默认 base prompt × ctx_len）上跑
+`--max-new-tokens 32 --num-runs 2`，run2 当 latency，scores 当 quality。
+然后 `--compare-to` 对应 ctx 的 dense reference，把 token match% / KL 写日志。
+
+### 验证
+
+- `python -m py_compile benchmarks/prepare_phi3_pathb_configs.py examples/run_hf_minimal.py`：通过。
+- `python -c "...; _parse_layer_range('8-13')"` 等 helper smoke：通过。
+- `python -c "...; _resolve_run_path(Path('dense_32k.json'))"`：返回
+  `benchmarks/results/runs/dense_32k.json`。
+
+### 服务器侧运行命令（直接 copy）
+
+环境变量略，按 Runtime section。下面所有命令都写 `--run-name <NAME>`，
+日志会落到 `benchmarks/results/runs/<NAME>.log`；commit/push 后我能直接读。
+
+1. 生成新 configs（一次）：
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  benchmarks/prepare_phi3_pathb_configs.py \
+  --extra-layer-ranges "7-14,8-12,9-12,8-14,9-14,10-13" \
+  --extra-topks "1,2,4"
+```
+
+2. 4 个 ctx 的 dense reference（每次保存 quality JSON，方便后续 compare）：
+
+```bash
+for CTX in 4096 16384 32768 65536; do
+  DM=npu:0; [ "$CTX" = "65536" ] && DM=auto
+  NAME=dense_ref_ctx${CTX}
+  PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+    examples/run_hf_minimal.py \
+    --attn-type dense --ctx-len $CTX --max-new-tokens 32 --num-runs 2 \
+    --empty-cache-between-runs \
+    --device-map "$DM" \
+    --save-output ${NAME}.json --run-name $NAME
+done
+```
+
+3. 32K layers8-13 topk1 quality + latency 对照（这是目前最佳点的质量验证）：
+
+```bash
+NAME=sparse_32k_layers8_13_topk1
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --attn-type minference \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json \
+  --ctx-len 32768 --max-new-tokens 32 --num-runs 2 --empty-cache-between-runs \
+  --device-map npu:0 \
+  --profile-branches \
+  --save-output ${NAME}.json \
+  --compare-to dense_ref_ctx32768.json \
+  --run-name $NAME
+```
+
+4. 64K 多卡 layers8-13 topk1 quality + latency 对照：
+
+```bash
+NAME=sparse_64k_layers8_13_topk1_auto
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --attn-type minference \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers8_13_all_heads_topk1_latency.json \
+  --ctx-len 65536 --max-new-tokens 32 --num-runs 2 --empty-cache-between-runs \
+  --device-map auto \
+  --profile-branches \
+  --save-output ${NAME}.json \
+  --compare-to dense_ref_ctx65536.json \
+  --run-name $NAME
+```
+
+5. layer range 横扫（按 32K 先一遍，然后挑一两个有希望的扩到 64K）：
+
+```bash
+for LR in 7_14 8_13 8_12 9_12 8_14 9_14 10_13; do
+  for K in 1 2 4; do
+    NAME=sparse_32k_layers${LR}_topk${K}
+    CFG=minference/configs/Phi_3_mini_128k_instruct_pathb_block_sparse_layers${LR}_all_heads_topk${K}_latency.json
+    PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+      examples/run_hf_minimal.py \
+      --attn-type minference --config-path $CFG \
+      --ctx-len 32768 --max-new-tokens 32 --num-runs 2 --empty-cache-between-runs \
+      --device-map npu:0 --profile-branches \
+      --save-output ${NAME}.json \
+      --compare-to dense_ref_ctx32768.json \
+      --run-name $NAME
+  done
+done
+```
+
+跑完后只要 `git add benchmarks/results/runs/ && git commit -m 'sweep logs' && git push`，
+我在开发机 `git pull` 就能直接读 `.log` / `.json`，不用你贴大段输出。
 
 ## 本轮进展（2026-05-28 多卡修复 + 上游算子对照）
 
