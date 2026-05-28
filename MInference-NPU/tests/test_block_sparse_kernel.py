@@ -53,6 +53,8 @@ block_sparse_kernel_npu = _load_module(
 _block_sparse_pytorch_ref = block_sparse_kernel_npu._block_sparse_pytorch_ref
 _build_block_sparse_mask = block_sparse_kernel_npu._build_block_sparse_mask
 _should_prefer_mask_npu = block_sparse_kernel_npu._should_prefer_mask_npu
+_should_use_tilelang_h1_query_block = block_sparse_kernel_npu._should_use_tilelang_h1_query_block
+_should_use_tilelang_h1_block_index = block_sparse_kernel_npu._should_use_tilelang_h1_block_index
 block_sparse_attention = block_sparse_kernel_npu.block_sparse_attention
 
 try:
@@ -244,6 +246,36 @@ def test_short_seq_mask_path_policy_env_invalid(monkeypatch):
     monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "oops")
     with pytest.warns(UserWarning, match="不是合法整数"):
         assert _should_prefer_mask_npu(4096)
+
+
+def test_tilelang_h1_query_block_policy_default(monkeypatch):
+    """完整 block 且 S_q 可按 16 行切分时，TileLang path-B 默认启用 H=1 query-block kernel。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    assert _should_use_tilelang_h1_query_block(4096, 4096, 64)
+    assert not _should_use_tilelang_h1_query_block(4097, 4096, 64)
+    assert not _should_use_tilelang_h1_query_block(4096, 4097, 64)
+    assert not _should_use_tilelang_h1_query_block(4096, 4096, 24)
+
+
+def test_tilelang_h1_query_block_policy_env_disable(monkeypatch):
+    """设为 0 可回退旧 padded-H TileLang kernel，方便 A/B benchmark。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", "0")
+    assert not _should_use_tilelang_h1_query_block(4096, 4096, 64)
+
+
+def test_tilelang_h1_block_index_policy_default(monkeypatch):
+    """block-index H=1 kernel 默认跟随 H=1 query-block 安全边界。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", raising=False)
+    assert _should_use_tilelang_h1_block_index(4096, 4096, 64)
+    assert not _should_use_tilelang_h1_block_index(4097, 4096, 64)
+
+
+def test_tilelang_h1_block_index_policy_env_disable(monkeypatch):
+    """设为 0 可保留旧 token-index 展开路径，便于隔离 wrapper 开销。"""
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX", "0")
+    assert not _should_use_tilelang_h1_block_index(4096, 4096, 64)
 
 
 # ---------------------------------------------------------------------------

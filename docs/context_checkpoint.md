@@ -1,13 +1,13 @@
 # Context Checkpoint
 
-Last update: 2026-05-27（晚 — block_sparse 短序列 path A + TileLang range-load 已接入，下一步 MHA）
+Last update: 2026-05-28（中 — block-index H=1 kernel 接入，解除 all-head indices OOM，但端到端时延未赢 dense）
 
 ## Current Direction
 
 PR-4 当前只关心两条真稀疏路径：
 
 - `stream_llm` —— **已重写为 hardware band + sink + LSE merge，并完成 4K-64K 验证**（不再走 TileLang）
-- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load，**下一阶段重点是去掉 fold-into-batch / padded-H 浪费**
+- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load，并新增 H=1 query-block kernel。dense-others 已改为 hardware causal band。**当前端到端瓶颈转向 block_sparse wrapper 的 token-level indices 展开与 sparse 覆盖率**
 - 验证模型固定 Phi-3-mini-128k-instruct
 
 不要回到已删除的老路线。Backup：
@@ -29,6 +29,191 @@ Local model：`/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 `PYTHONPATH` 里的 `~/tilelang-ascend` 现在只为 `block_sparse` 需要；stream_llm 路径已不依赖 TileLang。
 
 ## 本轮进展（2026-05-27 block_sparse staging）
+
+### E2E 继续优化：跳过 HF 4D mask + dense-others hardware band（2026-05-28）
+
+代码改动：
+
+- `minference/patch.py`
+  - patch Phi-3 modeling module 里的 `_prepare_4d_causal_attention_mask`。
+  - 当 2D `attention_mask` 无 padding（全 1）时直接返回 `None`，避免 HF 在进入 layer loop 前构造 `[B,1,S,S]` 4D causal mask。
+  - 若检测到真实 padding，则回退 HF 原 helper，保证语义不乱。
+- `minference/backend_npu/attention.py`
+  - `dense_attention(..., causal=True)` 在 `S_q == S_k` 且 `S <= MINFERENCE_DENSE_BAND_MAX_SEQ` 时改走 `npu_fusion_attention(sparse_mode=4, pre_tockens=S-1, next_tockens=0)`。
+  - 这用 Ascend hardware causal band 表达 full causal prefill，不再每次构造 `SxS` bool causal mask。
+  - 默认 `MINFERENCE_DENSE_BAND_MAX_SEQ=32768`；64K full causal band 曾触发 AICore 异常，暂时保守回退旧 masked path。
+- `tests/test_dense_attention_band.py`
+  - 新增 dense-band standalone smoke，验证 `S=128/512/1024` 与 CPU fp32 causal reference 的最大误差均为 `9.7656e-04`。
+- `examples/run_hf_minimal.py`
+  - 保留上一轮新增的 `--empty-cache-between-runs`，用于长上下文重复 run 调试。
+
+验证：
+
+- `python -m py_compile minference/patch.py minference/backend_npu/attention.py examples/run_hf_minimal.py tests/test_dense_attention_band.py`：通过。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python tests/test_dense_attention_band.py`：通过。
+
+E2E probe（Phi-3-mini-128k-instruct，block_sparse probe config，默认短序列 path A，`--num-runs 2`，比较 run2）：
+
+| ctx | sparse probe run2 | current dense run2 | old dense baseline in checkpoint | notes |
+|---:|---:|---:|---:|---|
+| 4K | 0.29s | TBD | 0.29s | sparse probe 回到 dense 同量级 |
+| 8K | 0.60s | TBD | 0.69s | dense-others band 化后明显下降 |
+| 16K | 1.58s | 1.36s | 2.05s | sparse probe 也变快，但当前 dense baseline 更快 |
+| 32K | 4.65s | 3.88s | 6.67s | 32K sparse probe 从上一轮 7.23s 降到 4.65s，但仍慢于新 dense baseline |
+
+分支计时变化：
+
+- 32K block_sparse probe：
+  - dense-others branch 从上一轮 `9.399s / 64 calls` 降到 `4.266s / 64 calls`。
+  - 说明 hardware causal band 正在实质降低端到端公共 dense 分支开销。
+- 16K block_sparse probe：
+  - branch timings: `block_sparse=0.811s / 12 calls`，`dense=1.089s / 64 calls`。
+
+64K 注意：
+
+- dense-band full causal 在 64K (`pre_tockens=65535`) 的 HF run 中触发过 AICore 异常；因此默认阈值限制在 32768。
+- 64K 端到端仍需要后续单独处理；目前不能把 dense-band 阈值贸然拉到 64K。
+
+### sparse 覆盖率实验：all-head block_sparse 暂不可作为当前端到端方案
+
+为了验证“提高 sparse 覆盖率是否直接带来 E2E 收益”，新增/生成 latency configs：
+
+- `benchmarks/prepare_phi3_pathb_configs.py`
+  - 新增输出 `Phi_3_mini_128k_instruct_pathb_block_sparse_all_heads_latency.json`（1024/1024 heads 全部 block_sparse，topk_blocks=16）。
+- 手动生成：
+  - `Phi_3_mini_128k_instruct_pathb_block_sparse_all_heads_topk4_latency.json`（全 heads，topk_blocks=4）。
+- `minference/modules/minference_forward.py`
+  - 新增 `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK`，默认 8，限制 block_sparse group 每次处理的 head 数，避免全 heads 时 token-level indices 一次性展开 OOM。
+
+实验结果（32K，全 heads）：
+
+| config | result |
+|---|---:|
+| all heads, topk=16, no chunk | 第二轮 OOM：token-level indices 约 `32 * 32768 * 1024 * int32 ~= 4GiB`/layer-call |
+| all heads, topk=16, chunk=8 | 能跑，run2 `22.73s`，过慢 |
+| all heads, topk=4, chunk=8 | 能跑，run2 `7.31s`，仍慢于 new dense baseline `3.88s` |
+
+结论：
+
+- 当前 wrapper 把 block indices 展开成 token-level indices `[B*H, S, topk_blocks*64]`，这是扩大 sparse 覆盖率后的主要内存和调度瓶颈。
+- 简单提高 sparse 覆盖率不够；全 heads 会被 indices 展开和 chunk 调度吃掉收益。
+- 下一步应写 **block-index H=1 kernel**：kernel 直接接收 block indices `[B*H, n_q_blocks, topk_blocks]` 或 `[B*H, S/block, topk_blocks]`，内部按 block range-load K/V，不再构造 `[B*H, S, topk_blocks*64]` token indices。
+- 这一步比继续微调现有 H=1 token-index kernel更接近端到端目标。
+
+### H=1 / query-block TileLang kernel 第一阶段（isolated，已跑通）
+
+已选择方案 A：先写专门的 H=1 kernel，绕开当前 `heads=1` 仍按 `H_per_block=16` padded-head 计算的问题。
+
+本阶段没有接入 `block_sparse_attention` 主路径，只新增 isolated kernel 和 smoke 测试：
+
+- `minference/ops/tilelang_sparse_attention_h1.py`
+  - 新增 `build_sparse_attention_h1_block_fwd(...)`。
+  - 输入仍是 folded-head 后的 BSHD/BSGD 形态：`q [B,S_q,1,D]`、`k/v [B,S_k,1,D]`、`indices [B,S_q,1,topk]`。
+  - kernel 每个 work item 处理 `block_M=16` 个 query token × 1 个真实 head，而不是旧 kernel 的 1 个 query token × 16 个 padded head 槽。
+  - 这样仍使用 `gemm_v0([16,D] x [64,D])` 和 `gemm_v0([16,64] x [64,D])`，但 16 行全部是真实 query token，不再是 15 行空 head。
+  - V 侧 softmax 仍按 `v_block = block_M // 2 = 8` 行运行，避开之前尝试 `H_per_block=2/4/8` 时触发的 AICore vector illegal config。
+  - 第一版约束：fp16、causal、`kv_group=1/head=1`、`block_M` 至少 16、运行时 `S_q` 暂按 `block_M` 整除处理；indices 预期是 block_sparse 形态，即同一个 query block 内行共享 K block list。
+- `tests/test_tilelang_sparse_attention_h1.py`
+  - 新增 isolated smoke：`one-block` / `two-block`。
+  - reference 复用现有 `sparse_attention_qkv_reference`。
+
+验证：
+
+- `python -m py_compile minference/ops/tilelang_sparse_attention_h1.py tests/test_tilelang_sparse_attention_h1.py`：通过。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python tests/test_tilelang_sparse_attention_h1.py --case all`：通过。
+  - `one-block`：`max_abs_diff=9.7656e-04`，PASS。
+  - `two-block`：`max_abs_diff=9.7656e-04`，PASS。
+- 回归确认旧 H=1 padded-head kernel smoke 仍通过：
+  - `tests/test_tilelang_sparse_attention.py --case h1-one-block`：PASS，`max_abs_diff=9.7656e-04`。
+
+踩坑记录：
+
+- 新 TileLang kernel 文件不能使用 `from __future__ import annotations`。否则 `T.prim_func` 的参数 annotation 会被 Python 延迟成字符串，TVM parser 报 `expected Object but got str`。该问题已修复。
+
+结论：
+
+- 方案 A 的第一块已经证明：可以用 query-token 维度填满 16 行，绕开 padded-head 浪费，同时保留 Ascend 友好的 `v_block=8` softmax 形态。
+
+### H=1 / query-block TileLang kernel 第二阶段（已接入 path-B）
+
+代码改动：
+
+- `minference/ops/block_sparse_kernel_npu.py`
+  - `_block_sparse_tilelang_npu` 在 folded `B*H` 后默认调用 `tilelang_sparse_attention_h1.build_sparse_attention_h1_block_fwd(...)`。
+  - 仅在安全边界内启用新 kernel：`S_q % 16 == 0`、`S_q % block_size == 0`、`S_k % block_size == 0`、`block_size % 16 == 0`。
+  - 不满足边界时回退旧 `build_sparse_attention_qkv_fwd(..., use_contiguous_range_load=...)`。
+  - 新增回退开关：`MINFERENCE_BLOCK_SPARSE_TILELANG_H1=0` 可强制旧 padded-H kernel，便于 A/B benchmark。
+- `benchmarks/bench_tilelang_h1_sparse_attention.py`
+  - 新增 isolated micro-benchmark，对比旧 padded-H=1 kernel 和新 query-block H=1 kernel。
+- `tests/test_block_sparse_kernel.py`
+  - 新增 H=1 query-block 启用/禁用策略测试。
+- `examples/run_hf_minimal.py`
+  - 新增 `--empty-cache-between-runs`，仅用于 64K 等长上下文重复 generate 调试，避免 HF 4D mask 重复分配/缓存碎片导致第二轮 OOM；默认关闭，不改变已有 benchmark 口径。
+
+验证：
+
+- `python -m py_compile minference/ops/block_sparse_kernel_npu.py minference/ops/tilelang_sparse_attention_h1.py tests/test_block_sparse_kernel.py benchmarks/bench_tilelang_h1_sparse_attention.py`：通过。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python -m pytest tests/test_block_sparse_kernel.py -q`：35 passed，1 warning。
+- `PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python tests/test_tilelang_sparse_attention_h1.py --case all`：通过。
+
+isolated micro-benchmark：
+
+| S | D | topk blocks | old padded-H=1 | new query-H=1 | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 64 | 1 | 1.077 ms | 1.048 ms | 1.03x |
+| 512 | 64 | 2 | 1.106 ms | 1.065 ms | 1.04x |
+| 512 | 64 | 4 | 1.153 ms | 1.067 ms | 1.08x |
+| 1024 | 64 | 1 | 1.113 ms | 1.070 ms | 1.04x |
+| 1024 | 64 | 2 | 1.236 ms | 1.106 ms | 1.12x |
+| 1024 | 64 | 4 | 1.945 ms | 1.063 ms | 1.83x |
+| 2048 | 64 | 1 | 1.490 ms | 1.175 ms | 1.27x |
+| 2048 | 64 | 2 | 2.056 ms | 1.125 ms | 1.83x |
+| 2048 | 64 | 4 | 3.847 ms | 1.084 ms | 3.55x |
+| 4096 | 128 | 16 | 29.919 ms | 2.224 ms | 13.46x |
+
+所有 isolated case 的 `old_vs_new_diff` 都是 `0.0000e+00`。
+
+wrapper benchmark（`bench_tilelang_long_context.py`，`MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ=0`，`D=128`，`topk_blocks=16`）：
+
+| S | kernel | mean |
+|---:|---|---:|
+| 4096 | new H=1 query-block | 3.37 ms |
+| 4096 | old padded-H (`MINFERENCE_BLOCK_SPARSE_TILELANG_H1=0`) | 31.43 ms |
+| 8192 | new H=1 query-block | 5.67 ms |
+| 16384 | new H=1 query-block | 10.46 ms |
+| 32768 | new H=1 query-block | 20.71 ms |
+| 65536 | new H=1 query-block | 41.08 ms |
+
+32K/64K wrapper 结果已写入：
+
+```text
+benchmarks/results/block_sparse_h1_32k_64k.json
+```
+
+4K forced TileLang HF probe（Phi-3-mini-128k-instruct，block_sparse probe config，`MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ=0`，`--num-runs 3`）：
+
+- run1：15.76s（含 JIT）
+- run2：0.41s
+- run3：0.41s
+- 对比上一轮 forced TileLang 4K 稳态 `~1.62s`，端到端 forced path-B 约 3.95x 改善。
+
+短/中上下文 HF probe（同一 block_sparse probe config，除特别说明外 `MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ=0` 强制 TileLang path-B）：
+
+| ctx | run2/run3 steady | notes |
+|---:|---:|---|
+| 4K | 0.41s / 0.41s | forced TileLang；接近 path A，但仍慢于 checkpoint 中 path A `0.32s` |
+| 8K | 0.91s / 0.91s | forced TileLang；慢于 checkpoint 中 path A `0.75s` |
+| 16K | 2.44s / 2.45s | forced TileLang；略慢于 checkpoint 中 path A `2.24s` |
+| 32K | 7.33s run2 | 默认 path-B；接近 checkpoint 中 dense baseline `6.67s`，但尚未超过 |
+| 64K | 53.53s run2 | `device_map=auto` + `--empty-cache-between-runs`；未加该开关时第二轮因 HF 4D mask 再分配 32GiB OOM |
+
+结论：
+
+- H=1 query-block kernel 已经实质打掉旧 path-B 的 padded-H 主瓶颈；越接近真实 `D=128/topk=1024`，收益越明显。
+- 4K forced TileLang 已从完全不可用的 `1.62s` 拉到 `0.41s`，接近短序列 path A 口径（checkpoint 中 4K path A run2 `0.32s`）。
+- 8K/16K forced TileLang 仍慢于短序列 path A，因此 **暂时不要降低/取消 `MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ=16384` 默认阈值**。
+- 32K 默认 path-B 已经能跑到接近 dense baseline，但端到端还没赢；64K 端到端主要被 HF 4D causal mask、跨卡/公共开销和 dense-others 拖住，kernel wrapper 本身 64K 只有 `41.08ms`。
+- 下一步不要再纠缠 H=1 kernel 主体；更应该处理 HF 端 O(S²) mask 构造/复用，以及扩大 sparse 覆盖率或减少 dense-others。
 
 - `minference/ops/block_sparse_kernel_npu.py`
   - 新增短序列调度策略：fp16 NPU block_sparse 在 `S <= 16384` 时默认优先走 `_block_sparse_npu`（`sparse_mode=1 + bool mask`）。

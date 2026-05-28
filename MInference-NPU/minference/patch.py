@@ -36,6 +36,57 @@ __all__ = [
 # ----------------------------------------------------------------------------
 
 
+def _patch_causal_mask_helper(attention_module: torch.nn.Module) -> None:
+    """Skip Phi/Llama-family 4D causal mask materialization when it is unused.
+
+    The patched attention forward in this workspace ignores HF's prebuilt
+    4D mask and applies causal semantics inside each backend kernel.  Phi-3's
+    model forward still calls ``_prepare_4d_causal_attention_mask`` before the
+    layer loop, which costs O(S^2) time and memory.  For the common inference
+    case with no padding (2D attention_mask is all ones), returning ``None`` is
+    equivalent for our patched attention modules.
+
+    If a real padding mask is detected, fall back to HF's original helper.
+    """
+
+    import importlib
+
+    module = importlib.import_module(attention_module.__class__.__module__)
+    helper_name = "_prepare_4d_causal_attention_mask"
+    original = getattr(module, helper_name, None)
+    if original is None or getattr(original, "_minference_skip4d", False):
+        return
+
+    def _minference_prepare_4d_causal_attention_mask(
+        attention_mask,
+        input_shape,
+        inputs_embeds,
+        past_key_values_length,
+        sliding_window=None,
+    ):
+        if attention_mask is None:
+            return None
+        try:
+            # In our generation probes the mask is [B, S] and all ones.  The
+            # small reduction is cheap and avoids materializing [B, 1, S, S].
+            has_padding = bool((attention_mask == 0).any().item())
+        except Exception:  # noqa: BLE001
+            has_padding = True
+        if not has_padding:
+            return None
+        return original(
+            attention_mask,
+            input_shape,
+            inputs_embeds,
+            past_key_values_length,
+            sliding_window=sliding_window,
+        )
+
+    _minference_prepare_4d_causal_attention_mask._minference_skip4d = True  # type: ignore[attr-defined]
+    _minference_prepare_4d_causal_attention_mask._minference_original = original  # type: ignore[attr-defined]
+    setattr(module, helper_name, _minference_prepare_4d_causal_attention_mask)
+
+
 def minference_patch(model: torch.nn.Module, config: Any) -> torch.nn.Module:
     """把 `model.model.layers[*].self_attn.forward` 替换为 NPU 版 minference_forward。
 
@@ -56,6 +107,7 @@ def minference_patch(model: torch.nn.Module, config: Any) -> torch.nn.Module:
 
     AttentionClass = attention_module.__class__
     forward_closure = minference_forward()
+    _patch_causal_mask_helper(attention_module)
 
     # Inject runtime settings so each attention layer can initialize itself.
     model.config.starting_layer = config.starting_layer

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
 
@@ -75,6 +76,11 @@ def main() -> int:
         type=int,
         default=1,
         help="同一进程内重复 generate 次数；用于区分首次开销/JIT 与 steady-state。",
+    )
+    parser.add_argument(
+        "--empty-cache-between-runs",
+        action="store_true",
+        help="长上下文调试用：每次 generate 后释放输出并 empty_cache，避免 HF 4D mask 重复分配导致 OOM。",
     )
     args = parser.parse_args()
 
@@ -247,6 +253,13 @@ def main() -> int:
                 dt_run = time.time() - t0
                 run_times.append(dt_run)
                 print(f"    run {run_idx + 1}/{args.num_runs}: {dt_run:.2f}s")
+                if args.empty_cache_between_runs and run_idx + 1 < args.num_runs:
+                    del out
+                    out = None
+                    _sync_npu()
+                    gc.collect()
+                    if hasattr(torch, "npu"):
+                        torch.npu.empty_cache()
     finally:
         for module, attr, original in pathb_restores:
             setattr(module, attr, original)

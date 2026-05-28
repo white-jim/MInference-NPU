@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -40,6 +41,116 @@ __all__ = [
     "decode_dense",
     "is_npu_available",
 ]
+
+_COMPRESSED_MASK_SIZE = 2048
+_COMPRESSED_CAUSAL_MASK_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_DENSE_BAND_MAX_SEQ_ENV = "MINFERENCE_DENSE_BAND_MAX_SEQ"
+_DEFAULT_DENSE_BAND_MAX_SEQ = 32768
+
+
+def _dense_band_max_seq() -> int:
+    raw = os.environ.get(_DENSE_BAND_MAX_SEQ_ENV)
+    if raw is None or raw == "":
+        return _DEFAULT_DENSE_BAND_MAX_SEQ
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_DENSE_BAND_MAX_SEQ
+
+
+def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    key = (device, torch.bool)
+    cached = _COMPRESSED_CAUSAL_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = torch.triu(
+        torch.ones((_COMPRESSED_MASK_SIZE, _COMPRESSED_MASK_SIZE), device=device, dtype=torch.bool),
+        diagonal=1,
+    )
+    _COMPRESSED_CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
+def _call_causal_band_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_heads: int,
+    scale: float,
+):
+    """Use Ascend hardware band attention to express full causal attention.
+
+    ``sparse_mode=4`` computes a causal band.  With ``pre_tokens = S_k - 1`` and
+    ``next_tokens = 0`` the band covers all previous keys, i.e. full causal
+    prefill, without materializing an ``S_q x S_k`` bool mask.
+    """
+
+    pre_tokens = k.size(-2) - 1
+    common = dict(
+        head_num=num_heads,
+        input_layout="BNSD",
+        scale=scale,
+        sparse_mode=4,
+        atten_mask=_compressed_causal_mask(q.device),
+    )
+    try:
+        return torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            pre_tockens=pre_tokens,
+            next_tockens=0,
+            **common,
+        )
+    except TypeError:
+        return torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            pre_tokens=pre_tokens,
+            next_tokens=0,
+            **common,
+        )
+
+
+def _call_masked_causal_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_heads: int,
+    scale: float,
+):
+    s_q = q.size(-2)
+    s_k = k.size(-2)
+    # causal: 允许 j <= i + (s_k - s_q)；True means masked in torch_npu.
+    causal_mask = torch.ones(s_q, s_k, device=q.device, dtype=torch.bool).triu(
+        diagonal=s_k - s_q + 1
+    )
+    try:
+        return torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=num_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=causal_mask,
+        )
+    except TypeError:
+        # 个别 torch_npu 小版本只接受 uint8 mask
+        return torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
+            q,
+            k,
+            v,
+            head_num=num_heads,
+            input_layout="BNSD",
+            scale=scale,
+            sparse_mode=1,
+            atten_mask=causal_mask.to(torch.uint8),
+        )
 
 
 def is_npu_available() -> bool:
@@ -119,35 +230,28 @@ def dense_attention(
         )
         return result[0] if isinstance(result, (tuple, list)) else result
 
-    s_q = q.size(-2)
-    s_k = k.size(-2)
-    # causal: 允许 j <= i + (s_k - s_q)；True means masked in torch_npu.
-    causal_mask = torch.ones(s_q, s_k, device=q.device, dtype=torch.bool).triu(
-        diagonal=s_k - s_q + 1
+    if q.size(-2) == k.size(-2) and q.size(-2) <= _dense_band_max_seq():
+        try:
+            result = _call_causal_band_attention(
+                q,
+                k,
+                v,
+                num_heads=num_heads,
+                scale=scale,
+            )
+            return result[0] if isinstance(result, (tuple, list)) else result
+        except Exception:  # noqa: BLE001
+            # Keep correctness over speed if a CANN/torch_npu build rejects
+            # sparse_mode=4 for this shape.
+            pass
+
+    result = _call_masked_causal_attention(
+        q,
+        k,
+        v,
+        num_heads=num_heads,
+        scale=scale,
     )
-    try:
-        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-            q,
-            k,
-            v,
-            head_num=num_heads,
-            input_layout="BNSD",
-            scale=scale,
-            sparse_mode=1,
-            atten_mask=causal_mask,
-        )
-    except TypeError:
-        # 个别 torch_npu 小版本只接受 uint8 mask
-        result = torch_npu.npu_fusion_attention(  # type: ignore[union-attr]
-            q,
-            k,
-            v,
-            head_num=num_heads,
-            input_layout="BNSD",
-            scale=scale,
-            sparse_mode=1,
-            atten_mask=causal_mask.to(torch.uint8),
-        )
     return result[0] if isinstance(result, (tuple, list)) else result
 
 

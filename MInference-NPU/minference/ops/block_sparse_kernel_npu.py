@@ -64,6 +64,12 @@ _MAX_SEQ_FOR_MASK = 16384
 _PREFER_MASK_MAX_SEQ_ENV = "MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ"
 _DEFAULT_PREFER_MASK_MAX_SEQ = 16384
 
+# TileLang path-B 默认使用 H=1 query-block kernel。设为 0 可回到旧 padded-H kernel，
+# 便于做 A/B benchmark 或快速规避新 kernel 的边界问题。
+_TILELANG_H1_QUERY_BLOCK_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_H1"
+_TILELANG_H1_BLOCK_INDEX_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX"
+_TILELANG_H1_BLOCK_M = 16
+
 # 默认 block size（与上游 block_sparse_flash_attention.py 一致）
 _DEFAULT_BLOCK_SIZE = 64
 
@@ -106,6 +112,26 @@ def _preferred_mask_max_seq() -> int:
 
 def _should_prefer_mask_npu(seq_len: int) -> bool:
     return seq_len <= min(_MAX_SEQ_FOR_MASK, _preferred_mask_max_seq())
+
+
+def _should_use_tilelang_h1_query_block(seq_len_q: int, seq_len_k: int, block_size: int) -> bool:
+    raw = os.environ.get(_TILELANG_H1_QUERY_BLOCK_ENV)
+    if raw is not None and raw.strip().lower() in {"0", "false", "off", "no"}:
+        return False
+
+    return (
+        seq_len_q % _TILELANG_H1_BLOCK_M == 0
+        and seq_len_q % block_size == 0
+        and seq_len_k % block_size == 0
+        and block_size % _TILELANG_H1_BLOCK_M == 0
+    )
+
+
+def _should_use_tilelang_h1_block_index(seq_len_q: int, seq_len_k: int, block_size: int) -> bool:
+    raw = os.environ.get(_TILELANG_H1_BLOCK_INDEX_ENV)
+    if raw is not None and raw.strip().lower() in {"0", "false", "off", "no"}:
+        return False
+    return _should_use_tilelang_h1_query_block(seq_len_q, seq_len_k, block_size)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +355,35 @@ def _block_sparse_tilelang_npu(
     S_k = k.shape[2]
     flat_B = B * H
 
+    q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)
+    k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
+    v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
+
+    block_indices = _select_block_sparse_topk_indices(q_flat, k_flat, topk_blocks, block_size)
+
+    q_bshd = q_flat.transpose(1, 2).contiguous()
+    k_bsgd = k_flat.transpose(1, 2).contiguous()
+    v_bsgd = v_flat.transpose(1, 2).contiguous()
+
+    if _should_use_tilelang_h1_block_index(S_q, S_k, block_size):
+        tilelang_sparse_attention_h1 = _load_sibling_module(
+            "tilelang_sparse_attention_h1_block_sparse_standalone",
+            "tilelang_sparse_attention_h1.py",
+        )
+        block_indices_bsh = block_indices.permute(0, 2, 1, 3).contiguous().to(
+            device=q.device,
+            dtype=torch.int32,
+        )
+        kernel = tilelang_sparse_attention_h1.build_sparse_attention_h1_block_index_fwd(
+            dim=D,
+            topk_blocks=block_indices_bsh.shape[-1],
+            block_M=_TILELANG_H1_BLOCK_M,
+            block_I=block_size,
+            q_start_index_s=S_k - S_q,
+        )
+        out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, block_indices_bsh)
+        return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
+
     tilelang_indices = _load_sibling_module(
         "tilelang_indices_block_sparse_standalone",
         "tilelang_indices.py",
@@ -337,12 +392,6 @@ def _block_sparse_tilelang_npu(
         "tilelang_sparse_attention_block_sparse_standalone",
         "tilelang_sparse_attention.py",
     )
-
-    q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)
-    k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
-    v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
-
-    block_indices = _select_block_sparse_topk_indices(q_flat, k_flat, topk_blocks, block_size)
     indices = tilelang_indices.block_indices_to_tilelang(
         block_indices,
         S_q=S_q,
@@ -356,19 +405,29 @@ def _block_sparse_tilelang_npu(
         torch.full_like(indices, tilelang_indices.TILELANG_PAD_VALUE),
     ).to(device=q.device, dtype=torch.int32)
 
-    kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
-        heads=1,
-        dim=D,
-        topk=indices.shape[-1],
-        kv_group=1,
-        block_I=block_size,
-        q_start_index_s=S_k - S_q,
-        use_contiguous_range_load=(S_k % block_size == 0),
-    )
+    if _should_use_tilelang_h1_query_block(S_q, S_k, block_size):
+        tilelang_sparse_attention_h1 = _load_sibling_module(
+            "tilelang_sparse_attention_h1_block_sparse_standalone",
+            "tilelang_sparse_attention_h1.py",
+        )
+        kernel = tilelang_sparse_attention_h1.build_sparse_attention_h1_block_fwd(
+            dim=D,
+            topk=indices.shape[-1],
+            block_M=_TILELANG_H1_BLOCK_M,
+            block_I=block_size,
+            q_start_index_s=S_k - S_q,
+        )
+    else:
+        kernel = tilelang_sparse_attention.build_sparse_attention_qkv_fwd(
+            heads=1,
+            dim=D,
+            topk=indices.shape[-1],
+            kv_group=1,
+            block_I=block_size,
+            q_start_index_s=S_k - S_q,
+            use_contiguous_range_load=(S_k % block_size == 0),
+        )
 
-    q_bshd = q_flat.transpose(1, 2).contiguous()
-    k_bsgd = k_flat.transpose(1, 2).contiguous()
-    v_bsgd = v_flat.transpose(1, 2).contiguous()
     out_bshd = kernel(q_bshd, k_bsgd, v_bsgd, indices)
     return out_bshd.transpose(1, 2).contiguous().reshape(B, H, S_q, D)
 

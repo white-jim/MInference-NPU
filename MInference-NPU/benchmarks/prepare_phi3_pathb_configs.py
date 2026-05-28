@@ -21,6 +21,9 @@ STREAM_DENSE_OTHERS_OUTPUT = (
 BLOCK_DENSE_OTHERS_OUTPUT = (
     CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_probe_dense_others.json"
 )
+BLOCK_ALL_HEADS_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_all_heads_latency.json"
+)
 NUM_LAYERS = 32
 NUM_HEADS = 32
 
@@ -93,6 +96,14 @@ def _build_config(
     return out, count
 
 
+def _build_all_block_sparse_config(*, topk_blocks: int) -> tuple[list[dict[str, list]], int]:
+    out = [
+        {str(head): ["block_sparse", topk_blocks, 0, 1.0] for head in range(NUM_HEADS)}
+        for _ in range(NUM_LAYERS)
+    ]
+    return out, NUM_LAYERS * NUM_HEADS
+
+
 def _write_json(path: Path, data: list[dict[str, list]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -104,6 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stream-dense-others-output", type=Path, default=STREAM_DENSE_OTHERS_OUTPUT)
     parser.add_argument("--block-dense-others-output", type=Path, default=BLOCK_DENSE_OTHERS_OUTPUT)
+    parser.add_argument("--block-all-heads-output", type=Path, default=BLOCK_ALL_HEADS_OUTPUT)
     parser.add_argument("--n-init", type=int, default=128)
     parser.add_argument("--n-local", type=int, default=896)
     parser.add_argument("--topk-blocks", type=int, default=16)
@@ -129,8 +141,12 @@ def main() -> int:
         n_local=args.n_local,
         topk_blocks=args.topk_blocks,
     )
+    block_all_heads_data, block_all_heads_count = _build_all_block_sparse_config(
+        topk_blocks=args.topk_blocks,
+    )
     _write_json(args.stream_dense_others_output, stream_dense_others_data)
     _write_json(args.block_dense_others_output, block_dense_others_data)
+    _write_json(args.block_all_heads_output, block_all_heads_data)
 
     print(
         f"[stream+dense-others] rewrote {stream_dense_others_count} heads "
@@ -139,6 +155,10 @@ def main() -> int:
     print(
         f"[block+dense-others]  rewrote {block_dense_others_count} heads "
         f"-> {args.block_dense_others_output}"
+    )
+    print(
+        f"[block+all-heads]     rewrote {block_all_heads_count} heads "
+        f"-> {args.block_all_heads_output}"
     )
     return 0
 

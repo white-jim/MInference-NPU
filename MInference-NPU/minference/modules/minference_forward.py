@@ -40,6 +40,16 @@ __all__ = [
 ROPE_TYPE: str | None = None
 
 
+def _block_sparse_head_chunk_size() -> int:
+    raw = os.environ.get("MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK")
+    if raw is None or raw == "":
+        return 8
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 8
+
+
 # ----------------------------------------------------------------------------
 # RoPE 类型探测（与上游同源，逻辑不变）
 # ----------------------------------------------------------------------------
@@ -373,16 +383,25 @@ def minference_forward():
                     output.index_copy_(1, head_idx_t, out_stream)
 
                 for topk, heads in block_groups.items():
-                    head_idx_t = torch.tensor(
-                        heads, device=query_states.device, dtype=torch.long
-                    )
-                    q = query_states.index_select(1, head_idx_t)
-                    k = key_states.index_select(1, head_idx_t)
-                    v = value_states.index_select(1, head_idx_t)
-                    out_block = _block_sparse_attention(
-                        q, k, v, topk_blocks=topk
-                    )
-                    output.index_copy_(1, head_idx_t, out_block)
+                    chunk_size = _block_sparse_head_chunk_size()
+                    if chunk_size <= 0:
+                        chunks = [heads]
+                    else:
+                        chunks = [
+                            heads[start : start + chunk_size]
+                            for start in range(0, len(heads), chunk_size)
+                        ]
+                    for chunk_heads in chunks:
+                        head_idx_t = torch.tensor(
+                            chunk_heads, device=query_states.device, dtype=torch.long
+                        )
+                        q = query_states.index_select(1, head_idx_t)
+                        k = key_states.index_select(1, head_idx_t)
+                        v = value_states.index_select(1, head_idx_t)
+                        out_block = _block_sparse_attention(
+                            q, k, v, topk_blocks=topk
+                        )
+                        output.index_copy_(1, head_idx_t, out_block)
         else:
             # decode 路径：一次性整 head 调用，不走 per-head 循环（与上游 line 584 一致）
             output = decode_dense(query_states, key_states, value_states)
