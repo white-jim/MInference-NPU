@@ -21,6 +21,15 @@ STREAM_DENSE_OTHERS_OUTPUT = (
 BLOCK_DENSE_OTHERS_OUTPUT = (
     CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_probe_dense_others.json"
 )
+BLOCK_PROBE_TOPK1_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_probe_dense_others_topk1.json"
+)
+BLOCK_PROBE_TOPK2_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_probe_dense_others_topk2.json"
+)
+BLOCK_PROBE_TOPK4_OUTPUT = (
+    CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_probe_dense_others_topk4.json"
+)
 BLOCK_ALL_HEADS_OUTPUT = (
     CONFIG_DIR / "Phi_3_mini_128k_instruct_pathb_block_sparse_all_heads_latency.json"
 )
@@ -187,6 +196,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stream-dense-others-output", type=Path, default=STREAM_DENSE_OTHERS_OUTPUT)
     parser.add_argument("--block-dense-others-output", type=Path, default=BLOCK_DENSE_OTHERS_OUTPUT)
+    parser.add_argument("--block-probe-topk1-output", type=Path, default=BLOCK_PROBE_TOPK1_OUTPUT)
+    parser.add_argument("--block-probe-topk2-output", type=Path, default=BLOCK_PROBE_TOPK2_OUTPUT)
+    parser.add_argument("--block-probe-topk4-output", type=Path, default=BLOCK_PROBE_TOPK4_OUTPUT)
     parser.add_argument("--block-all-heads-output", type=Path, default=BLOCK_ALL_HEADS_OUTPUT)
     parser.add_argument("--block-layers8-13-topk1-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK1_OUTPUT)
     parser.add_argument("--block-layers8-13-topk2-output", type=Path, default=BLOCK_LAYERS8_13_ALL_HEADS_TOPK2_OUTPUT)
@@ -246,6 +258,23 @@ def main() -> int:
     ]
     _write_json(args.stream_dense_others_output, stream_dense_others_data)
     _write_json(args.block_dense_others_output, block_dense_others_data)
+    probe_topk_outputs = [
+        (args.block_probe_topk1_output, 1),
+        (args.block_probe_topk2_output, 2),
+        (args.block_probe_topk4_output, 4),
+    ]
+    for output_path, topk in probe_topk_outputs:
+        probe_data, probe_count = _build_config(
+            mode="block_sparse",
+            n_init=args.n_init,
+            n_local=args.n_local,
+            topk_blocks=topk,
+        )
+        _write_json(output_path, probe_data)
+        print(
+            f"[block+probe]      rewrote {probe_count} heads "
+            f"(topk={topk}) -> {output_path}"
+        )
     _write_json(args.block_all_heads_output, block_all_heads_data)
     for output_path, topk in layer_range_outputs:
         layer_range_data, layer_range_count = _build_layer_range_block_sparse_config(

@@ -208,19 +208,19 @@ def _make_qkv_mh(device: torch.device, h_test: int):
 
 
 def _make_block_indices_mh(h_test: int, max_blocks: int) -> torch.Tensor:
-    """Per-head block indices: 每个 head 选不同的 K block 子集，覆盖 MH 路径。"""
+    """Per-head block indices: each head gets a different causal-visible subset."""
     n_q_blocks = S_Q // BLOCK
     block_indices = torch.zeros(B, h_test, n_q_blocks, max_blocks, dtype=torch.int32)
     if max_blocks == 1:
-        # head h 都选第 h % n_kb 个 K block
-        n_kb = S_K // BLOCK
         for h in range(h_test):
-            block_indices[:, h, :, 0] = h % n_kb
+            for qb in range(n_q_blocks):
+                block_indices[:, h, qb, 0] = h % (qb + 1)
     elif max_blocks == 2:
-        n_kb = S_K // BLOCK
         for h in range(h_test):
-            block_indices[:, h, :, 0] = h % n_kb
-            block_indices[:, h, :, 1] = (h + 1) % n_kb
+            for qb in range(n_q_blocks):
+                visible_blocks = qb + 1
+                block_indices[:, h, qb, 0] = h % visible_blocks
+                block_indices[:, h, qb, 1] = (h + 1) % visible_blocks
     else:
         raise ValueError(f"unsupported max_blocks={max_blocks}")
     return block_indices

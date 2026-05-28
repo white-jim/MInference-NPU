@@ -52,10 +52,14 @@ block_sparse_kernel_npu = _load_module(
 
 _block_sparse_pytorch_ref = block_sparse_kernel_npu._block_sparse_pytorch_ref
 _build_block_sparse_mask = block_sparse_kernel_npu._build_block_sparse_mask
+_select_block_sparse_topk_indices = block_sparse_kernel_npu._select_block_sparse_topk_indices
+_block_sparse_tilelang_npu_with_indices = block_sparse_kernel_npu._block_sparse_tilelang_npu_with_indices
 _should_prefer_mask_npu = block_sparse_kernel_npu._should_prefer_mask_npu
+_tilelang_h1_block_m = block_sparse_kernel_npu._tilelang_h1_block_m
 _should_use_tilelang_h1_query_block = block_sparse_kernel_npu._should_use_tilelang_h1_query_block
 _should_use_tilelang_h1_block_index = block_sparse_kernel_npu._should_use_tilelang_h1_block_index
 _should_use_tilelang_mh_block_index = block_sparse_kernel_npu._should_use_tilelang_mh_block_index
+_block_sparse_score_dtype = block_sparse_kernel_npu._block_sparse_score_dtype
 block_sparse_attention = block_sparse_kernel_npu.block_sparse_attention
 
 try:
@@ -84,6 +88,32 @@ def _causal_dense_ref(q, k, v):
     j = torch.arange(S_k, device=q.device)                  # [S_k]
     causal = abs_i[:, None] >= j[None, :]                   # [S_q, S_k]
     logits.masked_fill_(~causal[None, None], float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0)
+    return torch.matmul(probs, v.float()).to(q.dtype)
+
+
+def _block_sparse_ref_from_indices(q, k, v, block_indices, block_size):
+    """Reference attention for a fixed block sparsity pattern."""
+    B, H, S_q, D = q.shape
+    S_k = k.shape[2]
+    n_bq = math.ceil(S_q / block_size)
+    n_bk = math.ceil(S_k / block_size)
+
+    block_attend = torch.zeros(B, H, n_bq, n_bk, dtype=torch.bool, device=q.device)
+    block_attend.scatter_(-1, block_indices.to(q.device), True)
+    token_attend = (
+        block_attend.unsqueeze(3).unsqueeze(5)
+        .expand(-1, -1, -1, block_size, -1, block_size)
+        .reshape(B, H, n_bq * block_size, n_bk * block_size)
+    )[:, :, :S_q, :S_k]
+
+    abs_i = torch.arange(S_k - S_q, S_k, device=q.device)
+    j_idx = torch.arange(S_k, device=q.device)
+    token_attend = token_attend & (abs_i[:, None] >= j_idx[None, :])[None, None]
+
+    logits = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (D ** -0.5)
+    logits.masked_fill_(~token_attend, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0)
     return torch.matmul(probs, v.float()).to(q.dtype)
@@ -151,6 +181,52 @@ def test_mask_causal_invariant(s, block_size):
     j_idx = torch.arange(s)
     future_attended = attended & (i_idx[:, None] < j_idx[None, :])
     assert not future_attended.any(), "block-sparse mask 中存在未来 token 被 attend 的情况（因果约束违反）"
+
+
+@pytest.mark.parametrize("topk_blocks,block_size,s", [
+    (1, 64, 256),
+    (2, 64, 256),
+    (4, 64, 512),
+    (100, 64, 256),
+])
+def test_topk_indices_sorted_causal_and_clamped(topk_blocks, block_size, s):
+    """选块结果应有序、clamp；超出当前可见范围的 slots 由 token causal 过滤。"""
+    B, H, D = 1, 2, 64
+    q, k, _ = _make_qkv(B, H, s, s, D, torch.float32, seed=23)
+    n_bq = math.ceil(s / block_size)
+    n_bk = math.ceil(s / block_size)
+
+    idx = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
+    expected_topk = min(topk_blocks, n_bk)
+    assert idx.shape == (B, H, n_bq, expected_topk)
+    assert (idx[..., 1:] >= idx[..., :-1]).all()
+
+    idx_cpu = idx.cpu()
+    q_block = torch.arange(n_bq).view(1, 1, n_bq, 1)
+    visible = idx_cpu <= q_block
+    expected_visible = torch.minimum(
+        torch.full((n_bq,), expected_topk),
+        torch.arange(n_bq) + 1,
+    ).view(1, 1, n_bq)
+    assert torch.equal(visible.sum(dim=-1), expected_visible.expand(B, H, n_bq))
+
+
+@pytest.mark.parametrize("topk_blocks,block_size,s", [
+    (1, 64, 256),
+    (2, 64, 256),
+    (4, 64, 512),
+])
+def test_pytorch_ref_matches_fixed_indices_reference(topk_blocks, block_size, s):
+    """PyTorch block_sparse ref 应等价于固定 selector 结果后的稀疏 attention。"""
+    B, H, D = 1, 2, 64
+    q, k, v = _make_qkv(B, H, s, s, D, torch.float32, seed=31)
+
+    idx = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
+    ref = _block_sparse_pytorch_ref(q, k, v, topk_blocks=topk_blocks, block_size=block_size)
+    gold = _block_sparse_ref_from_indices(q, k, v, idx, block_size)
+
+    max_diff = (ref.float() - gold.float()).abs().max().item()
+    assert max_diff < 1e-4, f"ref vs fixed-index gold max_abs_diff={max_diff:.2e}"
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +344,11 @@ def test_short_seq_mask_path_policy_head_env_invalid(monkeypatch):
 
 
 def test_tilelang_h1_query_block_policy_default(monkeypatch):
-    """完整 block 且 S_q 可按 16 行切分时，TileLang path-B 默认启用 H=1 query-block kernel。"""
+    """完整 block 且 S_q 可按 block_M 行切分时，TileLang path-B 默认启用 H=1 kernel。"""
     monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", raising=False)
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_M", raising=False)
+    assert _tilelang_h1_block_m(64) == 64
+    assert _tilelang_h1_block_m(32) == 32
     assert _should_use_tilelang_h1_query_block(4096, 4096, 64)
     assert not _should_use_tilelang_h1_query_block(4097, 4096, 64)
     assert not _should_use_tilelang_h1_query_block(4096, 4097, 64)
@@ -280,6 +359,20 @@ def test_tilelang_h1_query_block_policy_env_disable(monkeypatch):
     """设为 0 可回退旧 padded-H TileLang kernel，方便 A/B benchmark。"""
     monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_H1", "0")
     assert not _should_use_tilelang_h1_query_block(4096, 4096, 64)
+
+
+def test_tilelang_h1_block_m_policy_env(monkeypatch):
+    """block_M 可用环境变量回退到 16/32 做 kernel A/B。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_M", "32")
+    assert _tilelang_h1_block_m(64) == 32
+    assert _should_use_tilelang_h1_query_block(4096, 4096, 64)
+
+
+def test_tilelang_h1_block_m_policy_invalid(monkeypatch):
+    """非法 block_M 回退默认值，避免 benchmark 拼错后悄悄改变 kernel 形状。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_M", "48")
+    with pytest.warns(UserWarning, match="整除 block_size"):
+        assert _tilelang_h1_block_m(64) == 64
 
 
 def test_tilelang_h1_block_index_policy_default(monkeypatch):
@@ -322,6 +415,27 @@ def test_tilelang_mh_block_index_follows_block_index_disable(monkeypatch):
     assert not _should_use_tilelang_mh_block_index(4096, 4096, 64)
 
 
+def test_block_sparse_score_dtype_policy_cpu_default(monkeypatch):
+    monkeypatch.delenv("MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE", raising=False)
+    q = torch.empty(1, 1, 64, 64, dtype=torch.float16)
+    assert _block_sparse_score_dtype(q) == torch.float32
+
+
+def test_block_sparse_score_dtype_policy_env(monkeypatch):
+    q = torch.empty(1, 1, 64, 64, dtype=torch.float16)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE", "fp16")
+    assert _block_sparse_score_dtype(q) == torch.float16
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE", "fp32")
+    assert _block_sparse_score_dtype(q) == torch.float32
+
+
+def test_block_sparse_score_dtype_policy_invalid(monkeypatch):
+    q = torch.empty(1, 1, 64, 64, dtype=torch.float16)
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE", "oops")
+    with pytest.warns(UserWarning, match="不是支持的 dtype"):
+        assert _block_sparse_score_dtype(q) == torch.float32
+
+
 # ---------------------------------------------------------------------------
 # 5. NPU 路径 vs PyTorch ref（仅在 NPU 环境运行）
 # ---------------------------------------------------------------------------
@@ -362,8 +476,32 @@ def test_npu_vs_pytorch_ref(case, dtype):
 
 
 @pytest.mark.skipif(not _HAS_NPU, reason="需要 torch_npu 且有 NPU 设备")
-def test_tilelang_path_b_forced_vs_pytorch_ref(monkeypatch):
-    """强制短序列走 TileLang path-B，覆盖 block_sparse wrapper 的 range-load 接入。"""
+@pytest.mark.parametrize("topk", [1, 2, 4])
+def test_tilelang_path_b_single_head_with_fixed_indices_vs_ref(monkeypatch, topk):
+    """固定单头 block indices 后，TileLang path-B 应对齐 PyTorch 稀疏 reference。"""
+    monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "0")
+    B, H, S, D = 1, 1, 512, 64
+    block_size = 64
+    device = torch.device("npu:0")
+
+    q, k, v = _make_qkv(B, H, S, S, D, torch.float16, device=str(device), seed=11 + topk)
+    block_indices = _select_block_sparse_topk_indices(q, k, topk, block_size)
+    ref = _block_sparse_ref_from_indices(
+        q.cpu().float(),
+        k.cpu().float(),
+        v.cpu().float(),
+        block_indices.cpu(),
+        block_size=block_size,
+    ).to(torch.float16)
+
+    out = _block_sparse_tilelang_npu_with_indices(q, k, v, block_indices, block_size).cpu()
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    assert max_diff < 6e-2, f"TileLang path-B fixed-index vs ref: max_abs_diff={max_diff:.2e}"
+
+
+@pytest.mark.skipif(not _HAS_NPU, reason="需要 torch_npu 且有 NPU 设备")
+def test_tilelang_path_b_wrapper_vs_pytorch_ref(monkeypatch):
+    """顶层 wrapper 仍覆盖 selector + TileLang kernel 的组合路径。"""
     monkeypatch.setenv("MINFERENCE_BLOCK_SPARSE_MASK_MAX_SEQ", "0")
     B, H, S, D = 1, 2, 256, 64
     topk, block_size = 2, 64
@@ -380,7 +518,7 @@ def test_tilelang_path_b_forced_vs_pytorch_ref(monkeypatch):
 
     out = block_sparse_attention(q, k, v, topk_blocks=topk, block_size=block_size).cpu()
     max_diff = (out.float() - ref.float()).abs().max().item()
-    assert max_diff < 6e-2, f"TileLang path-B forced vs ref: max_abs_diff={max_diff:.2e}"
+    assert max_diff < 6e-2, f"TileLang path-B wrapper vs ref: max_abs_diff={max_diff:.2e}"
 
 
 # ---------------------------------------------------------------------------

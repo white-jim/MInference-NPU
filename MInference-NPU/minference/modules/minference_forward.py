@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 from importlib import import_module
 
@@ -26,28 +27,41 @@ from transformers.models.llama.modeling_llama import rotate_half
 from ..backend_npu import dense_attention, decode_dense
 from ..ops.streaming_kernel_npu import streaming_forward as _streaming_forward
 from ..ops.block_sparse_kernel_npu import block_sparse_attention as _block_sparse_attention
+from ..ops.vertical_slash_kernel_npu import vertical_slash_sparse_attention as _vs_sparse_attention
 
 __all__ = [
     "init_minference_parameters",
     "minference_forward",
     "set_rope_type",
+    "sum_all_diagonal_matrix",
     "get_cos_sin",
     "apply_rotary_pos_emb_single",
     "gather_last_q_sparse_topk",
 ]
 
 
+LAST_Q = 64
+_LAST_Q_MASK_CACHE: dict[torch.device, torch.Tensor] = {}
 ROPE_TYPE: str | None = None
 
 
 def _block_sparse_head_chunk_size() -> int:
     raw = os.environ.get("MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK")
     if raw is None or raw == "":
-        return 8
+        return 0
     try:
         return max(0, int(raw))
     except ValueError:
-        return 8
+        return 0
+
+
+def _last_q_mask(device: torch.device) -> torch.Tensor:
+    mask = _LAST_Q_MASK_CACHE.get(device)
+    if mask is None:
+        arange = torch.arange(LAST_Q, device=device)
+        mask = arange[None, None, :, None] >= arange[None, None, None, :]
+        _LAST_Q_MASK_CACHE[device] = mask
+    return mask
 
 
 # ----------------------------------------------------------------------------
@@ -105,6 +119,52 @@ def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim: int = 
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
     return (q * cos) + (rotate_half(q) * sin)
+
+
+def sum_all_diagonal_matrix(mat: torch.Tensor) -> torch.Tensor:
+    """Sum anti-diagonals of ``[B,H,n,m]`` into ``[B,H,n+m-1]``.
+
+    This is the upstream helper used by vertical-and-slash online index
+    estimation.
+    """
+    b, h, n, m = mat.shape
+    zero_mat = torch.zeros((b, h, n, n), device=mat.device, dtype=mat.dtype)
+    mat_padded = torch.cat((zero_mat, mat, zero_mat), -1)
+    mat_strided = mat_padded.as_strided(
+        (b, h, n, n + m), (h * n * (2 * n + m), n * (2 * n + m), 2 * n + m + 1, 1)
+    )
+    sum_diags = torch.sum(mat_strided, 2)
+    return sum_diags[:, :, 1:]
+
+
+def _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size):
+    """Estimate vertical/slash indices online and call vertical-slash attention."""
+    B, H, q_len, _ = q.shape
+    last_q = min(LAST_Q, q_len)
+    device = q.device
+
+    vertical_size = min(q_len, max(int(vertical_size), 30))
+    slash_size = min(q_len, max(int(slash_size), 50))
+
+    qk = torch.matmul(q[:, :, -last_q:, :], k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
+    lq_mask = _last_q_mask(device)[:, :, -last_q:, -last_q:]
+    qk[:, :, :, -last_q:] = torch.where(lq_mask, qk[:, :, :, -last_q:], float("-inf"))
+    qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+
+    vertical = qk.sum(-2, keepdim=True)
+    vertical[..., :30] = torch.inf
+    v_idx = torch.topk(vertical, vertical_size, dim=-1).indices.reshape(B, H, vertical_size)
+    v_idx = v_idx.sort(dim=-1, descending=False).values.to(torch.int32)
+
+    slash_diag = sum_all_diagonal_matrix(qk)
+    if last_q > 1:
+        slash_diag = slash_diag[..., : -last_q + 1]
+    slash_diag[..., -100:] = torch.inf
+    s_raw_idx = torch.topk(slash_diag, slash_size, dim=-1).indices
+    s_idx = (q_len - 1) - s_raw_idx
+    s_idx = s_idx.sort(dim=-1, descending=True).values.to(torch.int32)
+
+    return _vs_sparse_attention(q, k, v, v_idx, s_idx)
 
 
 # ----------------------------------------------------------------------------
@@ -167,7 +227,7 @@ def gather_last_q_sparse_topk(self, q, k, v, head_id: int):
         return decode_dense(q, k, v)
 
     ty, vertical_size, slash_size, _ = self.best_pattern.get(
-        head_id, ("dense", 0, 0, 1)
+        head_id, ("vertical_and_slash", 1000, 6096, 1)
     )
 
     if ty == "stream_llm":
@@ -181,9 +241,12 @@ def gather_last_q_sparse_topk(self, q, k, v, head_id: int):
     if ty == "dense":
         return dense_attention(q, k, v, causal=True)
 
+    if ty == "vertical_and_slash":
+        return _vertical_and_slash_kernel(self, q, k, v, vertical_size, slash_size)
+
     raise NotImplementedError(
         f"Unsupported pattern {ty!r}. This trimmed workspace only supports "
-        "'dense', 'stream_llm', and 'block_sparse'."
+        "'dense', 'stream_llm', 'block_sparse', and 'vertical_and_slash'."
     )
 
 
@@ -335,13 +398,16 @@ def minference_forward():
                 # Group heads by active pattern and parameters.
                 H = query_states.size(1)
                 dense_heads: list[int] = []
+                vs_groups: dict[tuple[int, int], list[int]] = {}
                 stream_groups: dict[tuple[int, int], list[int]] = {}
                 block_groups: dict[int, list[int]] = {}
                 for head in range(H):
                     ty, vsz, ssz, _ = self.best_pattern.get(
-                        head, ("dense", 0, 0, 1)
+                        head, ("vertical_and_slash", 1000, 6096, 1)
                     )
-                    if ty == "stream_llm":
+                    if ty == "vertical_and_slash":
+                        vs_groups.setdefault((int(vsz), int(ssz)), []).append(head)
+                    elif ty == "stream_llm":
                         stream_groups.setdefault((int(vsz), int(ssz)), []).append(head)
                     elif ty == "block_sparse":
                         block_groups.setdefault(int(vsz), []).append(head)
@@ -353,6 +419,23 @@ def minference_forward():
                         )
 
                 output = torch.empty_like(query_states)
+
+                for (vertical_size, slash_size), heads in vs_groups.items():
+                    head_idx_t = torch.tensor(
+                        heads, device=query_states.device, dtype=torch.long
+                    )
+                    q = query_states.index_select(1, head_idx_t)
+                    k = key_states.index_select(1, head_idx_t)
+                    v = value_states.index_select(1, head_idx_t)
+                    out_vs = _vertical_and_slash_kernel(
+                        self,
+                        q,
+                        k,
+                        v,
+                        vertical_size=vertical_size,
+                        slash_size=slash_size,
+                    )
+                    output.index_copy_(1, head_idx_t, out_vs)
 
                 if dense_heads:
                     if len(dense_heads) == H:

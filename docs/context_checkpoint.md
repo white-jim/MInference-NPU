@@ -1,13 +1,13 @@
 # Context Checkpoint
 
-Last update: 2026-05-28（深夜 — Tier 1 MH TileLang kernel；wrapper 取消 fold-into-batch；E2E quality 横扫降级，回到算法迁移 + 速度路线）
+Last update: 2026-05-28（夜间继续 — vertical_and_slash 原始模式接回 + 单测 smoke）
 
 ## Current Direction
 
 PR-4 当前只关心两条真稀疏路径：
 
 - `stream_llm` —— **已重写为 hardware band + sink + LSE merge，并完成 4K-64K 验证**（不再走 TileLang）
-- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load、H=1 query-block kernel、block-index H=1 kernel，并已修复 `device_map=auto` 多卡 TileLang cache/device 绑定问题。dense-others 已改为 hardware causal band。**token-level indices 展开/OOM 已解除；当前最好端到端点是 layers8-13 全 heads + topk1，在 32K 和 64K 多卡 run2 都小幅/明显超过 dense baseline**
+- `block_sparse` —— 4K-16K 默认先走 bool-mask NPU path A 作为过渡/对照；32K+ 仍是 TileLang path-B。TileLang path-B 已接入连续 block range-load、H=1 query-block kernel、block-index H=1 kernel，并已修复 `device_map=auto` 多卡 TileLang cache/device 绑定问题。dense-others 已改为 hardware causal band。**token-level indices 展开/OOM 已解除；当前最好 latency probe 是 layers8-13 全 heads + topk1，在 32K/64K run2 上可观察到加速，但这是强制单模式性能 probe，不是端到端质量结论**
 - 验证模型固定 Phi-3-mini-128k-instruct
 
 不要回到已删除的老路线。Backup：
@@ -27,6 +27,431 @@ PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python <cmd>
 Local model：`/data/guoshiyao/resources/models/Phi-3-mini-128k-instruct`
 
 `PYTHONPATH` 里的 `~/tilelang-ascend` 现在只为 `block_sparse` 需要；stream_llm 路径已不依赖 TileLang。
+
+## Development Workflow
+
+开始新一轮开发前，先确认当前工作空间是否包含完整项目：
+
+- 如果当前工作空间已经有完整 `MInference-NPU` 项目和可运行环境，可以直接在当前工作空间开发、测试。
+- 如果当前工作空间只是临时/镜像目录，或者没有完整项目、没有 NPU/CANN/conda 环境，则按远程开发方式执行：通过
+  `ssh CloudSet712@222.197.166.124` 访问服务器，在服务器项目目录
+  `/data/guoshiyao/zhw/MInference-NPU/MInference-NPU` 中读代码、运行测试和 benchmark。
+- 本地只作为编辑中转时，推荐流程是：`scp` 远程文件到本地临时目录，用 `apply_patch` 修改，再 `scp` 回服务器；验证命令仍在服务器项目目录执行。
+- 遇到远程访问、权限、环境变量、NPU 设备或 conda 环境问题时，不要猜测本地可替代，先向用户确认访问问题。
+
+## 阶段目标纠偏（最高优先级）
+
+当前还没有完整实现/接通三种稀疏模式，因此 **不要用强制单一稀疏模式的端到端生成质量来否定当前实现路线**。
+
+现阶段正在做的是：
+
+1. 逐个实现三种稀疏方式（例如 `stream_llm`、`block_sparse`，以及后续模式）。
+2. 每个稀疏方式先满足单测正确性：单头/小张量/隔离算子与 PyTorch dense 或对应稀疏定义 reference 对齐。
+3. 为了放大实现影响、观察性能上限，可以强制某些层/所有 head 走当前稀疏方式；这种强制配置的目的只是测 **加速效果**，不是测最终模型精度。
+4. 最终端到端精度只能在三种模式都实现后，按真实 `best_pattern` / 调度策略组合运行时评估。
+
+因此：
+
+- `layers8-13 all heads topk1/topk4/...` 这类配置是 latency / stress / coverage probe。
+- 这些 probe 的输出 token 是否匹配 dense 只能作为 sanity note，不能作为当前阶段的里程碑验收。
+- 当前阶段可接受的 correctness 验收是单测级别：例如单个 head 的 `block_sparse` 输出与 PyTorch reference / dense 退化 case 对齐。
+- 文档里旧的“真实 prompt 保精度 + 加速才算可用”的表述对当前阶段有误导性；保留历史数据，但后续不要沿着它继续跑偏。
+
+可用性边界：
+
+- 对外使用方式对标原始 MInference：保持原始 `best_pattern` / `config_path` / `attn_type` 入口语义，不额外设计新的用户层流程。
+- 当前不追求自造更通用的可用性抽象；实现上优先保持简单，方便完成三种稀疏模式迁移。
+- 环境变量只作为开发/benchmark 回退开关，不作为新增用户 API 宣传。
+- 后续优化优先放在 kernel、调度、原始 pattern 语义接通上，避免为了边角用法增加复杂度。
+- 2026-05-28 复核：曾尝试在 `minference_forward` 中为 contiguous/full-head group 增加 slice/copy 快路径；64K layers7-14 probe 只从 `18.02s` 波动到 `17.90s`，收益不足以换取额外 helper 复杂度，已撤掉。保留简单的原始 grouped-head dispatch 结构。
+
+## 本轮进展（2026-05-28 夜间继续 — block_sparse 单测与瓶颈定位）
+
+### 代码改动
+
+- `minference/ops/block_sparse_kernel_npu.py`
+  - 将 TileLang path-B 拆成两层：
+    - `_block_sparse_tilelang_npu(...)`：内部先 selector，再调 kernel。
+    - `_block_sparse_tilelang_npu_with_indices(...)`：接收预计算好的 `[B,H,n_q_blocks,topk]` block indices，直接执行 TileLang kernel。
+  - 修正文档/注释口径：`MINFERENCE_BLOCK_SPARSE_TILELANG_MH` 当前只是 all-head wrapper grouping，仍然 fold `B*H` 后复用 H=1 block-index kernel；不是原生 BSHD multi-head TileLang kernel。
+  - 将主路径 H=1 block-index kernel 的默认 `block_M` 从 16 调到 64，并新增 `MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_M` 作为回退/A-B 开关。
+- `tests/test_block_sparse_kernel.py`
+  - 新增 fixed-index PyTorch reference，用于把 selector 与 sparse kernel correctness 分开验证。
+  - 新增 selector 输出有序、topk clamp、可见 block 数正确的测试。
+  - 新增 NPU fixed-index 单头 TileLang path-B vs PyTorch sparse reference 测试，覆盖 topk=1/2/4。
+  - 保留顶层 wrapper vs PyTorch reference 测试，覆盖 selector + TileLang kernel 组合路径。
+  - 新增 `block_M` policy 测试，保证默认值和环境变量回退行为可控。
+- `benchmarks/probe_block_sparse_heads.py`
+  - 新增 `--profile-components`，可分别计时 full / selector-only / kernel-with-precomputed-indices。
+- `examples/run_hf_minimal.py`
+  - 新增 sparse path timing 输出，直接统计 `_block_sparse_tilelang_npu` / `_streaming_npu` 内部耗时。
+  - 新增 per-run 增量 timing 输出，区分 run1 TileLang JIT/编译开销和 run2 稳态耗时。后续判断加速效果应优先看 run2 增量，而不是两轮累计 branch timing。
+
+### 验证
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py -q
+```
+
+结果：`55 passed in 57.13s`。
+
+`block_M=64` 接入后复测：
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py -q
+```
+
+结果：`57 passed in 54.88s`。
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  tests/test_tilelang_sparse_attention_h1.py --case all
+```
+
+结果：7/7 PASS，所有 case `max_abs_diff=9.7656e-04`。
+
+### Component benchmark
+
+32K, D=128, `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0`, `--warmup 1 --repeats 3 --profile-components`：
+
+topk1：
+
+| H | full mean | selector mean | kernel mean |
+|---:|---:|---:|---:|
+| 1 | 3.08ms -> 2.40ms | 0.62ms -> 0.55ms | 2.31ms -> 1.62ms |
+| 8 | 9.95ms -> 4.95ms | 0.68ms -> 0.62ms | 9.38ms -> 4.45ms |
+| 32 | 34.91ms -> 14.78ms | 1.38ms -> 1.37ms | 34.42ms -> 14.43ms |
+
+topk4：
+
+| H | full mean | selector mean | kernel mean |
+|---:|---:|---:|---:|
+| 1 | 5.91ms -> 3.39ms | 0.83ms -> 0.77ms | 5.17ms -> 2.62ms |
+| 8 | 32.46ms -> 12.77ms | 1.25ms -> 1.32ms | 32.04ms -> 12.37ms |
+| 32 | 127.52ms -> 48.49ms | 3.95ms -> 4.08ms | 124.93ms -> 46.03ms |
+
+64K, H=32, topk1, `block_M=64`：
+
+| full mean | selector mean | kernel mean |
+|---:|---:|---:|
+| 29.16ms | 3.43ms | 27.14ms |
+
+隔离 H=1 microbench（32K, D=128）也验证 `block_M=64` 数值等价：
+
+| topk | block_M=16 block-index | block_M=64 block-index |
+|---:|---:|---:|
+| 1 | 1.779ms | 1.238ms |
+| 4 | 4.516ms | 1.856ms |
+
+结论：
+
+- 当前 block_sparse latency 主瓶颈明确在 TileLang sparse attention kernel 本体，不在 selector。
+- 继续调 `MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE` 或 Python head wrapper 不会带来主要收益。
+- `block_M=64` 已显著降低 kernel 时间，是当前 block_sparse 强制稀疏 probe 的有效加速改动。
+- 下一步优化仍应进入 kernel 侧：继续减少每个 selected block 的数据搬运/同步/softmax 开销，或实现真正 BSHD/MH kernel，而不是继续围绕 selector 做局部微调。
+
+### E2E latency probe after `block_M=64`
+
+重要口径：`run_hf_minimal.py --num-runs 2` 的累计 branch timing 会把 run1 TileLang JIT/编译时间和 run2 稳态时间加在一起。判断可用加速时应看 per-run 增量，尤其是 run2。
+
+64K, real prompt, `max_new_tokens=1`, `device_map=auto`, `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0`：
+
+Baseline dense 历史记录：
+
+- `dense_64k_realprompt_mnt1_auto.log`
+- run2：`22.34s`
+
+layers8-13 all heads topk1:
+
+| block_M | run2 total | run2 block_sparse | run2 dense branch |
+|---:|---:|---:|---:|
+| 16 | 19.42s | 0.549s / 6 calls | 2.313s / 26 calls |
+| 64 | 19.10s | 0.237s / 6 calls | 2.314s / 26 calls |
+
+结论：`block_M=64` 在 E2E 稳态 block_sparse 分支中约 `2.3x` 加速；总 run2 只小幅下降，因为该配置只覆盖 6 层，剩余模型非 attention / dense 部分仍占主导。
+
+layers7-14 all heads topk1（更大强制覆盖，用于 latency/stress probe）:
+
+| block_M | run2 total | run2 block_sparse | run2 dense branch |
+|---:|---:|---:|---:|
+| 64 | 18.02s | 0.323s / 8 calls | 1.749s / 24 calls |
+
+结论：更大 block_sparse 覆盖能把 64K forced-probe run2 推到 `18.02s`，相对 dense `22.34s` 有更清晰端到端加速。输出 token 偏移仍只作为 sanity note，不作为当前阶段质量验收。
+
+## 本轮进展（2026-05-28 夜间继续 — vertical_and_slash 接回原始语义）
+
+### 背景
+
+原始 Phi-3 best_pattern 统计：
+
+| pattern | heads |
+|---|---:|
+| `vertical_and_slash` | 981 |
+| `stream_llm` | 43 |
+
+也就是说 Phi-3 原始配置主要依赖 `vertical_and_slash`；`block_sparse` 是当前 forced latency probe 的重点，但不是该 Phi-3 原始 best_pattern 的主体。
+
+### 代码改动
+
+- 从备份恢复并接入：
+  - `minference/backend_npu/cuda_shim.py`
+  - `minference/ops/vertical_slash_kernel_npu.py`
+  - `tests/test_vertical_slash_kernel.py`
+  - `minference/configs/Phi_3_mini_128k_instruct_kv_out_v32_fit_o_best_pattern.json`
+- `minference/modules/minference_forward.py`
+  - 重新支持原始 pattern 名称 `vertical_and_slash`。
+  - 缺省 best_pattern 从临时 `dense` 回到原始 `("vertical_and_slash", 1000, 6096, 1)`。
+  - `vertical_size` / `slash_size` 语义按原始 MInference：在线估计 vertical 列和 slash 偏移，然后调用 `vertical_slash_sparse_attention`。
+  - forward 分组调度新增 `vertical_and_slash`，按相同 `(vertical_size, slash_size)` 合并 heads 调用；没有新增用户层 API。
+- `examples/run_hf_minimal.py`
+  - branch profiler 新增 `vertical_and_slash` timing。
+
+### 当前实现边界
+
+- `vertical_and_slash` 当前是 NPU path A：构建 token-level bool mask 后调用 `npu_fusion_attention(sparse_mode=1)`。
+- 该路径为了避免 O(S²) mask 内存，`S > 16384` 会退化为 causal dense。
+- 因此本轮 VS 的验收重点是“原始 pattern 语义接回 + 单测正确性 + 短上下文 HF smoke”，不是长上下文加速。
+- 长上下文加速需要后续把 VS 推到真正稀疏 path B（直接消费 vertical/slash indices），这是下一阶段 kernel 工作。
+
+### 验证
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_vertical_slash_kernel.py -q
+```
+
+结果：`27 passed, 1 warning in 9.53s`。
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py tests/test_streaming_kernel.py tests/test_vertical_slash_kernel.py -q
+```
+
+结果：`116 passed, 1 warning in 95.75s`。
+
+HF smoke：
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  examples/run_hf_minimal.py \
+  --config-path minference/configs/Phi_3_mini_128k_instruct_kv_out_v32_fit_o_best_pattern.json \
+  --ctx-len 1024 --max-new-tokens 1 --device-map npu:0 \
+  --attn-type minference --profile-branches --num-runs 1 \
+  --run-name vs_original_phi3_ctx1024_smoke
+```
+
+结果：
+
+- run1 total：`1.51s`
+- branch timings:
+  - `vertical_and_slash: 0.988s over 118 calls`
+  - `stream_llm: 0.031s over 6 calls`
+- 输出文本：`'x'`
+
+注意：`sparse path hits` 中 VS 当前没有计数，是因为 `_vertical_and_slash_kernel` 在 `minference_forward` 内持有 `_vs_sparse_attention` alias；以 branch timing 为准，已经确认 VS 分支真实命中。
+
+## 历史误判记录（2026-05-28 夜间复核 2 — 曾误把强制单模式 probe 当端到端质量验收）
+
+### 纠偏说明
+
+下面这组真实 prompt 质量数据是历史记录，但其解释口径已被上面的“阶段目标纠偏”覆盖。正确理解是：
+
+- all-head topk1/topk4/topk8 是强制 block_sparse 覆盖的 latency/stress probe。
+- 这类 probe 本来就不代表最终 `best_pattern` 组合精度。
+- 不能用它们的端到端 token 偏移来否定 block_sparse 单模式实现。
+- 当前阶段 block_sparse 的 correctness 以单测/isolated reference 为准；强制端到端 run 主要看加速效果和稳定性。
+
+### 代码改动
+
+- `minference/ops/block_sparse_kernel_npu.py`
+  - 新增 `MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE` 实验开关。
+  - 默认仍使用 fp32 做 block score / top-k 选择，保证保守精度语义。
+  - 可显式设 `MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE=fp16` 做 latency A/B，但实测稳态收益不明显，不建议作为默认。
+- `tests/test_block_sparse_kernel.py`
+  - 新增 score dtype policy 测试。
+- `benchmarks/prepare_phi3_pathb_configs.py`
+  - 新增 43-head probe topk1/topk2/topk4 配置输出。
+- `benchmarks/probe_block_sparse_heads.py`
+  - 新增 `--warmup` / `--repeats`，避免把 TileLang JIT 首次编译当成稳态算子耗时。
+
+### 验证
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py -q
+```
+
+结果：`45 passed in 27.32s`。
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m py_compile minference/ops/block_sparse_kernel_npu.py \
+  benchmarks/prepare_phi3_pathb_configs.py \
+  benchmarks/probe_block_sparse_heads.py \
+  tests/test_block_sparse_kernel.py
+```
+
+通过。
+
+### Selector dtype A/B
+
+32K, H=32, topk1, `benchmarks/probe_block_sparse_heads.py --warmup 1 --repeats 3`：
+
+| selector dtype | mean | min | max |
+|---|---:|---:|---:|
+| default fp32 | 35.05ms | 34.41ms | 35.88ms |
+| fp16 experiment | 35.08ms | 34.66ms | 35.29ms |
+
+结论：score dtype 不是当前主瓶颈。默认保持 fp32，`fp16` 仅作为可回退实验开关。
+
+### 真实 prompt 32K 结果
+
+Baseline：`dense_ref_ctx32768_realprompt.log`
+
+- dense run2 `6.50s`
+- dense output prefix: `ryphon said. “Let’s hear the history.” ...`
+
+| config | run2 | branch | quality vs dense |
+|---|---:|---|---|
+| layers8-13 all heads topk1 | 6.60s | block_sparse `16.914s / 48 calls`, dense `3.657s / 52 calls` | token greedy match `4/32`，ref-mass `0.1755` |
+| 43-head probe topk1 + chunk0 | 6.76s | block_sparse `16.311s / 12 calls`, dense `4.263s / 64 calls` | token greedy match `10/32`，ref-mass `0.3813` |
+| layers9-12 all heads topk1 + chunk0 | 6.65s | block_sparse `15.320s / 8 calls`, dense `3.929s / 56 calls` | token greedy match `3/32`，ref-mass `0.2555` |
+
+历史观察：
+
+- 32K 真实 prompt 下，强制单模式 probe 的生成质量偏离 dense。
+- 这不作为当前阶段的 block_sparse 实现否决条件。
+- 43-head probe 质量相对好些，但速度慢于 dense；all-head 低 topk 能放大性能影响但会偏离最终组合语义。
+
+### 真实 prompt 64K `max_new_tokens=1` 结果
+
+Baseline：`dense_64k_realprompt_mnt1_auto.log`
+
+- dense run2 `22.34s`
+- dense next token text: `skim`
+
+| config | run2 | next token text | branch |
+|---|---:|---|---|
+| layers8-13 all heads topk1 + chunk0 | 19.43s | `into` | block_sparse `29.325s / 12 calls`, dense `6.923s / 52 calls` |
+| layers8-13 all heads topk4 + chunk0 | 20.61s | `into` | block_sparse `33.121s / 12 calls`, dense `6.964s / 52 calls` |
+| layers8-13 all heads topk8 + chunk0 | 22.05s | `sm` | block_sparse `36.693s / 12 calls`, dense `6.965s / 52 calls` |
+| layers8-13 all heads topk16 + chunk0 | 24.96s | `through` | block_sparse `42.887s / 12 calls`, dense `6.993s / 52 calls` |
+| 43-head probe topk16 + chunk0 | 22.99s | `skim` | block_sparse `33.670s / 12 calls`, dense `10.471s / 64 calls` |
+
+历史观察：
+
+- topk1/topk4 在 64K 强制 block_sparse probe 中确实更快。
+- topk8 接近速度打平。
+- 43-head probe topk16 能匹配 1-token dense 输出，但速度慢于 dense。
+- 这些数据只说明强制单模式配置的质量/速度现象，不是当前阶段最终可用性判定。
+
+### 更新后的下一步建议
+
+1. 继续把 all-head / layer-range 强制 block_sparse 当作性能 probe 使用，目标是放大当前实现影响并测加速上限。
+2. correctness 继续用单头/isolated 单测守住：与 PyTorch reference、dense 退化 case、causal invariant 对齐。
+3. 不再把真实 prompt 端到端 token match 当当前阶段里程碑。
+4. 等三种稀疏模式都实现并按 `best_pattern` 组合后，再回到完整端到端质量评估。
+
+## 本轮进展（2026-05-28 夜间复核 — Tier 1 MH 服务器验证）
+
+### 关键纠偏
+
+检查点上一版写的"真 BSHD MH TileLang kernel / wrapper 取消 fold-into-batch"与当前服务器代码不一致。当前代码实际状态：
+
+- `build_sparse_attention_mh_block_index_fwd(...)` 只是返回 `build_sparse_attention_h1_block_index_fwd(...)`。
+- `_block_sparse_tilelang_npu` 的 MH path 仍先把 `B*H` fold 到 batch，再调用 H=1 block-index kernel。
+- `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0` 可以把 HF E2E 的 block_sparse calls 从 48 降到 12，但这是一次 wrapper 处理全 H 后 fold 成 `B*H`，不是 cube 内真实跨 head 融合。
+
+结论：Tier 1 目前没有实现真 MH kernel；现有代码只能验证"减少 wrapper/head_chunk 调度"的收益。实测收益很小，下一步若继续 kernel 侧优化，应进入真正 BSHD kernel 或 Tier 2，而不是继续调 MH 开关。
+
+### 修复
+
+- `tests/test_tilelang_sparse_attention_h1.py`
+  - 修正 MH smoke 的 per-head block indices 生成。
+  - 旧测试会让早期 query block 对某些 head 只选到全未来 K block，causal mask 后整行不可见，softmax 产生 NaN。
+  - 新测试保证每个 query block 至少有一个 causal-visible block，同时保留不同 head 的 block 选择差异。
+
+### 验证结果
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  tests/test_tilelang_sparse_attention_h1.py --case all
+```
+
+结果：7/7 PASS。MH cases 误差均为 `max_abs_diff=9.7656e-04`。
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m pytest tests/test_block_sparse_kernel.py -q
+```
+
+结果：`42 passed in 27.13s`。
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  -m py_compile tests/test_tilelang_sparse_attention_h1.py
+```
+
+通过。
+
+### Microbenchmark 结论
+
+命令：
+
+```bash
+PYTHONPATH=$PWD:~/tilelang-ascend conda run -n flexhead-tl python \
+  benchmarks/bench_tilelang_h1_sparse_attention.py \
+  --seq-lens 4096 16384 32768 \
+  --topk-blocks 1 4 16 \
+  --dim 128 \
+  --mh-heads 8 32 \
+  --mh-head-chunks 0 8
+```
+
+H=1 kernel 仍健康：
+
+- 32768 topk1：old padded H1 `16.251ms`，block-index H1 `1.534ms`
+- 32768 topk4：old padded H1 `61.888ms`，block-index H1 `4.292ms`
+- 32768 topk16：old padded H1 `242.547ms`，block-index H1 `15.505ms`
+
+MH vs H=1 chunked 基本等价：
+
+- 32768 H32 topk1 chunk0：MH `46.865ms`，H1 chunked `46.864ms`
+- 32768 H32 topk1 chunk8：MH `46.854ms`，H1 chunked `47.209ms`
+- 32768 H32 topk4 chunk0：MH `133.950ms`，H1 chunked `134.054ms`
+- 32768 H32 topk16 chunk0：MH `489.344ms`，H1 chunked `489.305ms`
+
+`mh-summary positive_cases=19/36`，整体可视为噪声级差异。
+
+### 32K E2E A/B
+
+配置：Phi-3-mini-128k-instruct，layers8-13 all heads topk1，ctx=32768，max_new_tokens=1，num_runs=2，device_map=npu:0，profile-branches。
+
+| run | env | run1 | run2 | block_sparse branch | dense branch | output |
+|---|---|---:|---:|---:|---:|---|
+| `mh_on_sparse_32k_layers8_13_topk1` | default | 20.38s | 3.78s | 16.937s / 48 calls | 3.661s / 52 calls | `over` |
+| `mh_off_sparse_32k_layers8_13_topk1` | `MINFERENCE_BLOCK_SPARSE_TILELANG_MH=0` | 20.27s | 3.78s | 16.821s / 48 calls | 3.674s / 52 calls | `over` |
+| `mh_on_chunk0_sparse_32k_layers8_13_topk1` | `MINFERENCE_BLOCK_SPARSE_HEAD_CHUNK=0` | 20.22s | 3.74s | 16.721s / 12 calls | 3.692s / 52 calls | `over` |
+
+日志：
+
+- `benchmarks/results/runs/mh_on_sparse_32k_layers8_13_topk1.log`
+- `benchmarks/results/runs/mh_off_sparse_32k_layers8_13_topk1.log`
+- `benchmarks/results/runs/mh_on_chunk0_sparse_32k_layers8_13_topk1.log`
+
+结论：
+
+- 默认 MH on/off 无差异，且都是 48 calls，说明当前 MH 开关没有带来真实 kernel-level MH。
+- `HEAD_CHUNK=0` 把 calls 降到 12，但 branch 总时长只从约 `16.8-16.9s` 到 `16.7s`，run2 只小幅 `3.78s -> 3.74s`。
+- wrapper/launch 开销不是主导；当前 block_sparse 计算本体和同步占主要部分。
+
+### 下一步建议
+
+1. 若继续 kernel 路线：实现真正 BSHD MH block-index kernel，不能再 alias 到 H=1 builder；但预期仅减少 wrapper 开销可能不够，需要同时考虑 cube 内跨 head 批处理 / 更高算术利用率。
+2. 若回到产品目标：优先接 best_pattern 的自然 sparse/dense 分配，避免 all-head topk1 这种质量风险很高的强制配置。
+3. 若继续 benchmark：用真实文本 prompt 做 `HEAD_CHUNK=0` vs default 的 latency sanity 即可，不建议再横扫当前 fake-MH 开关。
 
 ## 本轮进展（2026-05-28 深夜 — Tier 1 MH TileLang kernel + 路线收回）
 

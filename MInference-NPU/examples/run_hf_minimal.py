@@ -273,6 +273,7 @@ def _run_with_args(args: argparse.Namespace) -> int:
         print("[2/4] 跳过 patch (attn_type='hf')")
 
     pathb_counts = {}
+    pathb_stats = {}
     pathb_restores = []
     branch_stats = {}
     branch_restores = []
@@ -304,13 +305,14 @@ def _run_with_args(args: argparse.Namespace) -> int:
         try:
             import minference.ops.block_sparse_kernel_npu as block_sparse_kernel_npu
             import minference.ops.streaming_kernel_npu as streaming_kernel_npu
+            import minference.ops.vertical_slash_kernel_npu as vertical_slash_kernel_npu
 
             _wrap_timed(
                 block_sparse_kernel_npu,
                 "_block_sparse_tilelang_npu",
                 "block_sparse",
                 pathb_restores,
-                stats={},
+                stats=pathb_stats,
                 count_success=True,
             )
             # stream_llm 已切到 hardware band+sink；命中计数挂在 _streaming_npu 上。
@@ -319,7 +321,15 @@ def _run_with_args(args: argparse.Namespace) -> int:
                 "_streaming_npu",
                 "stream_llm",
                 pathb_restores,
-                stats={},
+                stats=pathb_stats,
+                count_success=True,
+            )
+            _wrap_timed(
+                vertical_slash_kernel_npu,
+                "vertical_slash_sparse_attention",
+                "vertical_and_slash",
+                pathb_restores,
+                stats=pathb_stats,
                 count_success=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -330,6 +340,12 @@ def _run_with_args(args: argparse.Namespace) -> int:
             import minference.modules.minference_forward as minference_forward
 
             _wrap_timed(minference_forward, "dense_attention", "dense", branch_restores)
+            _wrap_timed(
+                minference_forward,
+                "_vertical_and_slash_kernel",
+                "vertical_and_slash",
+                branch_restores,
+            )
             _wrap_timed(minference_forward, "_streaming_forward", "stream_llm", branch_restores)
             _wrap_timed(
                 minference_forward,
@@ -377,6 +393,8 @@ def _run_with_args(args: argparse.Namespace) -> int:
             input_ids_device = input_ids.to(model_device)
             attention_mask_device = attention_mask.to(model_device)
             for run_idx in range(args.num_runs):
+                pathb_before = _stats_snapshot(pathb_stats)
+                branch_before = _stats_snapshot(branch_stats)
                 t0 = time.time()
                 gen_kwargs = dict(
                     attention_mask=attention_mask_device,
@@ -395,6 +413,18 @@ def _run_with_args(args: argparse.Namespace) -> int:
                 dt_run = time.time() - t0
                 run_times.append(dt_run)
                 print(f"    run {run_idx + 1}/{args.num_runs}: {dt_run:.2f}s")
+                if pathb_stats:
+                    _print_stats_delta(
+                        f"    run {run_idx + 1} sparse path timings:",
+                        pathb_before,
+                        pathb_stats,
+                    )
+                if branch_stats:
+                    _print_stats_delta(
+                        f"    run {run_idx + 1} branch timings:",
+                        branch_before,
+                        branch_stats,
+                    )
                 if args.empty_cache_between_runs and run_idx + 1 < args.num_runs:
                     del out, gen_out
                     out = None
@@ -418,6 +448,10 @@ def _run_with_args(args: argparse.Namespace) -> int:
             "    sparse path hits: "
             + ", ".join(f"{name}={count}" for name, count in pathb_counts.items())
         )
+    if pathb_stats:
+        print("    sparse path timings:")
+        for name, item in sorted(pathb_stats.items()):
+            print(f"      {name}: {item['seconds']:.3f}s over {item['count']} calls")
     if branch_stats:
         print("    branch timings:")
         for name, item in sorted(branch_stats.items()):
@@ -455,6 +489,29 @@ def _run_with_args(args: argparse.Namespace) -> int:
         )
 
     return 0
+
+
+def _stats_snapshot(stats: dict) -> dict:
+    return {
+        name: (int(item.get("count", 0)), float(item.get("seconds", 0.0)))
+        for name, item in stats.items()
+    }
+
+
+def _print_stats_delta(title: str, before: dict, after: dict) -> None:
+    rows = []
+    for name in sorted(after):
+        prev_count, prev_seconds = before.get(name, (0, 0.0))
+        item = after[name]
+        count_delta = int(item.get("count", 0)) - prev_count
+        seconds_delta = float(item.get("seconds", 0.0)) - prev_seconds
+        if count_delta or seconds_delta:
+            rows.append((name, seconds_delta, count_delta))
+    if not rows:
+        return
+    print(title)
+    for name, seconds_delta, count_delta in rows:
+        print(f"      {name}: {seconds_delta:.3f}s over {count_delta} calls")
 
 
 def _save_quality_output(

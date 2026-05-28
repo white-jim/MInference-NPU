@@ -70,10 +70,16 @@ _DEFAULT_PREFER_MASK_MAX_HEADS = 16
 # 便于做 A/B benchmark 或快速规避新 kernel 的边界问题。
 _TILELANG_H1_QUERY_BLOCK_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_H1"
 _TILELANG_H1_BLOCK_INDEX_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_INDEX"
-# 多 head TileLang kernel：直接接 [B, S, H, D] BSHD layout，wrapper 不再 fold-into-batch。
-# 默认开启；设为 0 可强制回退到 H=1 fold-into-batch 路径，便于 A/B 对比。
+# Multi-head wrapper mode: fold all heads into the batch dimension, then reuse
+# the H=1 block-index kernel in one call. This is not a true BSHD MH kernel.
+# Default on; set to 0 to force the older H=1 fallback branch for A/B checks.
 _TILELANG_MH_BLOCK_INDEX_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_MH"
-_TILELANG_H1_BLOCK_M = 16
+_TILELANG_H1_BLOCK_M_ENV = "MINFERENCE_BLOCK_SPARSE_TILELANG_BLOCK_M"
+_DEFAULT_TILELANG_H1_BLOCK_M = 64
+
+# Block selection chooses sparse K blocks, so keep fp32 as the conservative
+# default. Set this env to "fp16" only for latency experiments.
+_BLOCK_SCORE_DTYPE_ENV = "MINFERENCE_BLOCK_SPARSE_SCORE_DTYPE"
 
 # 默认 block size（与上游 block_sparse_flash_attention.py 一致）
 _DEFAULT_BLOCK_SIZE = 64
@@ -137,16 +143,46 @@ def _should_prefer_mask_npu(seq_len: int, num_heads: int = 1) -> bool:
     )
 
 
+def _default_tilelang_h1_block_m(block_size: int) -> int:
+    if block_size >= _DEFAULT_TILELANG_H1_BLOCK_M:
+        return _DEFAULT_TILELANG_H1_BLOCK_M
+    return block_size if block_size >= 16 and block_size % 2 == 0 else 16
+
+
+def _tilelang_h1_block_m(block_size: int) -> int:
+    default = _default_tilelang_h1_block_m(block_size)
+    raw = os.environ.get(_TILELANG_H1_BLOCK_M_ENV)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"{_TILELANG_H1_BLOCK_M_ENV}={raw!r} 不是合法整数；回退默认值 {default}。",
+            stacklevel=2,
+        )
+        return default
+    if value < 16 or value % 2 != 0 or block_size % value != 0:
+        warnings.warn(
+            f"{_TILELANG_H1_BLOCK_M_ENV}={raw!r} 不满足 even、>=16 且整除 block_size={block_size}；"
+            f"回退默认值 {default}。",
+            stacklevel=2,
+        )
+        return default
+    return value
+
+
 def _should_use_tilelang_h1_query_block(seq_len_q: int, seq_len_k: int, block_size: int) -> bool:
     raw = os.environ.get(_TILELANG_H1_QUERY_BLOCK_ENV)
     if raw is not None and raw.strip().lower() in {"0", "false", "off", "no"}:
         return False
 
+    block_m = _tilelang_h1_block_m(block_size)
     return (
-        seq_len_q % _TILELANG_H1_BLOCK_M == 0
+        seq_len_q % block_m == 0
         and seq_len_q % block_size == 0
         and seq_len_k % block_size == 0
-        and block_size % _TILELANG_H1_BLOCK_M == 0
+        and block_size % block_m == 0
     )
 
 
@@ -158,15 +194,32 @@ def _should_use_tilelang_h1_block_index(seq_len_q: int, seq_len_k: int, block_si
 
 
 def _should_use_tilelang_mh_block_index(seq_len_q: int, seq_len_k: int, block_size: int) -> bool:
-    """MH path 启用条件 = block-index path 条件 + 未被环境变量显式关闭。
+    """Enable the all-head wrapper path unless explicitly disabled.
 
-    与 H=1 共用 ``block_M=16`` 边界；MH path 走自然 BSHD layout，省 fold-into-batch 和
-    head_chunk × kernel-call 的 Python 开销。
+    This path still folds ``B*H`` into batch before calling the H=1 kernel. It
+    only removes repeated Python wrapper calls for head chunks; it is not a
+    native BSHD multi-head TileLang kernel.
     """
     raw = os.environ.get(_TILELANG_MH_BLOCK_INDEX_ENV)
     if raw is not None and raw.strip().lower() in {"0", "false", "off", "no"}:
         return False
     return _should_use_tilelang_h1_block_index(seq_len_q, seq_len_k, block_size)
+
+
+def _block_sparse_score_dtype(q: torch.Tensor) -> torch.dtype:
+    raw = os.environ.get(_BLOCK_SCORE_DTYPE_ENV, "").strip().lower()
+    if raw in {"fp32", "float32"}:
+        return torch.float32
+    if raw in {"fp16", "float16", "half"}:
+        return torch.float16
+    if raw in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if raw not in {"", "auto"}:
+        warnings.warn(
+            f"{_BLOCK_SCORE_DTYPE_ENV}={raw!r} 不是支持的 dtype；回退 auto。",
+            stacklevel=2,
+        )
+    return torch.float32
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +247,9 @@ def _select_block_sparse_topk_indices(
     q_p = F.pad(q, (0, 0, 0, pad_q)) if pad_q else q  # [B, H, S_q_p, D]
     k_p = F.pad(k, (0, 0, 0, pad_k)) if pad_k else k  # [B, H, S_k_p, D]
 
-    q_pool = q_p.reshape(B, H, n_bq, block_size, D).mean(dim=3).float()  # [B, H, n_bq, D]
-    k_pool = k_p.reshape(B, H, n_bk, block_size, D).mean(dim=3).float()  # [B, H, n_bk, D]
+    score_dtype = _block_sparse_score_dtype(q)
+    q_pool = q_p.reshape(B, H, n_bq, block_size, D).mean(dim=3).to(score_dtype)  # [B, H, n_bq, D]
+    k_pool = k_p.reshape(B, H, n_bk, block_size, D).mean(dim=3).to(score_dtype)  # [B, H, n_bk, D]
 
     scale = D ** -0.5
     scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * scale  # [B, H, n_bq, n_bk]
@@ -391,12 +445,27 @@ def _block_sparse_tilelang_npu(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Path B: TileLang true sparse attention.
+    """Path B: TileLang true sparse attention with internal block selection."""
+    block_indices = _select_block_sparse_topk_indices(q, k, topk_blocks, block_size)
+    return _block_sparse_tilelang_npu_with_indices(q, k, v, block_indices, block_size)
 
-    优先尝试 MH kernel（``[B, S, H, D]`` 自然 layout，无 fold-into-batch + 无 head_chunk
-    多次 kernel-call 的 Python wrapper 开销）。MH 不可用时回退 H=1 query-block
-    block-index kernel（fold-into-batch 把 ``B*H`` 折到 batch 维），再不可用则回退
-    旧 padded-H kernel。
+def _block_sparse_tilelang_npu_with_indices(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Path B kernel call using precomputed block indices.
+
+    ``block_indices`` has shape ``[B, H, n_q_blocks, topk_blocks]`` and stores
+    K-block ids, not token ids. Keeping this helper separate lets tests verify
+    the sparse attention kernel for a fixed sparsity pattern and lets
+    benchmarks split selector time from kernel time.
+
+    The current all-head branch still folds heads into batch and calls the H=1
+    block-index kernel. It is a wrapper-level grouping path, not a true BSHD
+    multi-head TileLang kernel.
     """
     if q.dtype != torch.float16:
         raise NotImplementedError("TileLang block-sparse MVP only supports fp16")
@@ -405,16 +474,24 @@ def _block_sparse_tilelang_npu(
 
     B, H, S_q, D = q.shape
     S_k = k.shape[2]
+    if block_indices.shape[:3] != (B, H, math.ceil(S_q / block_size)):
+        raise ValueError(
+            "block_indices shape must be [B,H,n_q_blocks,topk_blocks]; "
+            f"got {tuple(block_indices.shape)} for q={tuple(q.shape)} block_size={block_size}"
+        )
+    block_m = _tilelang_h1_block_m(block_size)
     cache_device = _set_current_npu_device_for(q)
 
-    # MH path: fold B*H into batch (contiguous; avoids non-contiguous T.copy for H>1)
+    # All-head wrapper path: fold B*H into batch, then reuse the H=1 kernel.
     if _should_use_tilelang_mh_block_index(S_q, S_k, block_size):
         flat_B = B * H
         q_flat = q.contiguous().reshape(flat_B, 1, S_q, D)   # [B*H, 1, S, D]
         k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
         v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
-        block_indices_flat = _select_block_sparse_topk_indices(
-            q_flat, k_flat, topk_blocks, block_size
+        block_indices_flat = (
+            block_indices.contiguous()
+            .reshape(flat_B, block_indices.shape[2], block_indices.shape[3])
+            .unsqueeze(1)
         )  # [B*H, 1, n_q_blocks, topk]
         tilelang_sparse_attention_h1 = _load_sibling_module(
             "tilelang_sparse_attention_h1_block_sparse_standalone",
@@ -430,7 +507,7 @@ def _block_sparse_tilelang_npu(
         kernel = tilelang_sparse_attention_h1.build_sparse_attention_mh_block_index_fwd(
             dim=D,
             topk_blocks=block_indices_bsh.shape[-1],
-            block_M=_TILELANG_H1_BLOCK_M,
+            block_M=block_m,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
             cache_device=cache_device,
@@ -444,7 +521,11 @@ def _block_sparse_tilelang_npu(
     k_flat = k.contiguous().reshape(flat_B, 1, S_k, D)
     v_flat = v.contiguous().reshape(flat_B, 1, S_k, D)
 
-    block_indices = _select_block_sparse_topk_indices(q_flat, k_flat, topk_blocks, block_size)
+    block_indices_flat = (
+        block_indices.contiguous()
+        .reshape(flat_B, block_indices.shape[2], block_indices.shape[3])
+        .unsqueeze(1)
+    )  # [B*H, 1, n_q_blocks, topk]
 
     q_bshd = q_flat.transpose(1, 2).contiguous()
     k_bsgd = k_flat.transpose(1, 2).contiguous()
@@ -455,14 +536,14 @@ def _block_sparse_tilelang_npu(
             "tilelang_sparse_attention_h1_block_sparse_standalone",
             "tilelang_sparse_attention_h1.py",
         )
-        block_indices_bsh = block_indices.permute(0, 2, 1, 3).contiguous().to(
+        block_indices_bsh = block_indices_flat.permute(0, 2, 1, 3).contiguous().to(
             device=q.device,
             dtype=torch.int32,
         )
         kernel = tilelang_sparse_attention_h1.build_sparse_attention_h1_block_index_fwd(
             dim=D,
             topk_blocks=block_indices_bsh.shape[-1],
-            block_M=_TILELANG_H1_BLOCK_M,
+            block_M=block_m,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
             cache_device=cache_device,
@@ -479,7 +560,7 @@ def _block_sparse_tilelang_npu(
         "tilelang_sparse_attention.py",
     )
     indices = tilelang_indices.block_indices_to_tilelang(
-        block_indices,
+        block_indices_flat,
         S_q=S_q,
         block_size_M=block_size,
         block_size_N=block_size,
@@ -499,7 +580,7 @@ def _block_sparse_tilelang_npu(
         kernel = tilelang_sparse_attention_h1.build_sparse_attention_h1_block_fwd(
             dim=D,
             topk=indices.shape[-1],
-            block_M=_TILELANG_H1_BLOCK_M,
+            block_M=block_m,
             block_I=block_size,
             q_start_index_s=S_k - S_q,
             cache_device=cache_device,
